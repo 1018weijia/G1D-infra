@@ -8,7 +8,7 @@ G1-D 上的单人数采、LeRobot 转换上传、以及 policy 部署（含回�
 
 | 入口 | 做什么 | 不做什么 |
 |---|---|---|
-| `collect.py` / `scripts/run_collect.sh` | XR 遥操作录制 episode | 不回退、不接管、不对齐 |
+| `collect.py` / `scripts/run_collect.sh` | XR 遥操作录制 episode（默认录制，`--no-record` 关） | 不回退、不接管、不对齐 |
 | `policy_deploy.py` / `scripts/run_deploy.sh` | 云端 policy 推理、B 回退最近几秒、手柄坐标轴对齐后 A 接管 | 不负责日常采数 |
 
 数据流：
@@ -31,7 +31,7 @@ policy_deploy.py  <-  远端推理服务（SSH 隧道 + ZMQ/WebSocket）
 | `configs/alignment_targets.json` | 对齐目标位姿 |
 | `data_convert/` | JSON → LeRobot v3.0，以及 ModelScope 上传 |
 | `3rd/lerobot/` | 官方 LeRobot 源码（git submodule，固定 `8fff0fde`） |
-| `assets/` | URDF 与 meshes |
+| `assets/` | URDF、meshes，以及已构建好的 IK 模型缓存 |
 
 ## 环境
 

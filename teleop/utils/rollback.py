@@ -29,24 +29,3 @@ class PolicyRollbackBuffer:
 
     def __len__(self):
         return len(self._items)
-
-
-class RollbackBuffer:
-    def __init__(self, seconds, frequency):
-        self._items = deque(maxlen=max(1, int(np.ceil(seconds * frequency)) + 1))
-
-    def append(self, q, tau):
-        self._items.append((np.asarray(q, dtype=float).copy(), np.asarray(tau, dtype=float).copy()))
-
-    def clear(self):
-        self._items.clear()
-
-    def reverse_playback(self, exclude_latest=True):
-        items = list(self._items)
-        if exclude_latest and items:
-            items.pop()
-        self.clear()
-        return list(reversed(items))
-
-    def __len__(self):
-        return len(self._items)

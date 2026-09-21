@@ -16,11 +16,12 @@ cd ~/g1d_infra
 UNITREE_DDSINTERFACE=eth0 python collect.py \
   --ee dex1_internal \
   --input-mode controller \
-  --record \
   --task-dir ~/unitree_eai_environment/data/ \
   --task-name pick_place \
   --task-goal "pick and place"
 ```
+
+录制默认开启。想只遥操作、不写盘（练手或调试）加 `--no-record`。
 
 环境变量：`EE`、`INPUT_MODE`、`TASK_DIR`、`TASK_NAME`、`TASK_GOAL`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`。
 

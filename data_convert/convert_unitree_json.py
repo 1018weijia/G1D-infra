@@ -162,26 +162,27 @@ def _ensure_import_paths() -> None:
         sys.path.insert(0, official_src)
 
 
-def load_robot_configs(constants_path: Path | None = None):
+def resolve_constants_path(constants_path: Path | None = None) -> Path:
+    """Resolve --constants to a constants.py file. Defaults to this directory."""
     constants_path = Path(constants_path) if constants_path else DEFAULT_CONSTANTS_PATH
     if constants_path.is_dir():
         nested = constants_path / "unitree_lerobot" / "utils" / "constants.py"
         constants_path = nested if nested.exists() else constants_path / "constants.py"
-    try:
-        from unitree_lerobot.utils.constants import ROBOT_CONFIGS  # type: ignore
+    return constants_path
 
-        return ROBOT_CONFIGS
-    except ImportError:
-        if not constants_path.exists():
-            raise ImportError(
-                "Cannot import robot constants. "
-                f"Checked {constants_path}. Set --constants."
-            ) from None
-        spec = importlib.util.spec_from_file_location("unitree_robot_constants", constants_path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-        return module.ROBOT_CONFIGS
+
+def load_robot_configs(constants_path: Path | None = None):
+    """Load ROBOT_CONFIGS from a constants.py file, never from an installed package."""
+    constants_path = resolve_constants_path(constants_path)
+    if not constants_path.exists():
+        raise FileNotFoundError(
+            f"robot constants not found: {constants_path}. Set --constants."
+        )
+    spec = importlib.util.spec_from_file_location("unitree_robot_constants", constants_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.ROBOT_CONFIGS
 
 
 def parse_episode_ids(values: Iterable[str] | None) -> set[int]:
@@ -426,6 +427,7 @@ def extract_frame_vectors(sample: dict, vector_dims: dict[str, int]) -> dict[str
 
 def convert(args: argparse.Namespace) -> None:
     _ensure_import_paths()
+    print(f"Constants: {resolve_constants_path(args.constants)}")
     robot_configs = load_robot_configs(args.constants)
     if args.robot_type not in robot_configs:
         available = ", ".join(sorted(robot_configs))

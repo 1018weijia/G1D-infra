@@ -7,7 +7,5 @@ venv/
 .env.*
 .pytest_cache/
 datasets/
-g1_29_model_cache.pkl
-assets/g1/g1_29_model_cache.pkl
 *.mp4
 *.tar.gz

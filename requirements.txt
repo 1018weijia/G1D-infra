@@ -6,3 +6,8 @@ numpy
 opencv-python
 pyyaml
 tqdm
+pyzmq
+pytest
+# Optional: only speeds up --protocol ws; policy_client falls back to a
+# stdlib WebSocket client when this is missing.
+# websocket-client

@@ -122,7 +122,7 @@ if __name__ == '__main__':
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='controller', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
-    parser.add_argument('--arm', type=str, choices=['G1', 'H2', 'R1'], default='G1', help='Select arm controller')
+    parser.add_argument('--arm', type=str, choices=['G1'], default='G1', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex1_internal', 'dex3', 'brainco', 'inspire_ftp', 'inspire_dfx'], help='Select end effector controller')
     # mobile base, elevation and waist control
     parser.add_argument('--base-type', type=str, choices=['mobile_lift', 'lift','legs'], default='mobile_lift', help='Select lower body type')
@@ -134,7 +134,8 @@ if __name__ == '__main__':
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # record mode and task info
-    parser.add_argument('--record', action = 'store_true', help = 'Enable data recording mode')
+    parser.add_argument('--record', action = 'store_true', default = True, help = 'Record episodes (default: on)')
+    parser.add_argument('--no-record', action = 'store_false', dest = 'record', help = 'Teleoperate without writing episodes')
     parser.add_argument('--task-dir', type = str, default = '/home/unitree/unitree_eai_environment/data/', help = 'path to save data')
     parser.add_argument('--task-name', type = str, default = 'pick cube', help = 'task file name for recording')
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
@@ -202,12 +203,6 @@ if __name__ == '__main__':
                                                               xr_motion_data_ready_in=xr_motion_data_ready)
             else:
                 arm_ctrl = G1_29_ArmController(simulation_mode=args.sim, use_waist=args.use_waist)
-        elif args.arm == "H2":
-            logger_mp.warning("H2 arm is not supported yet.")
-            raise NotImplementedError("H2 arm is not supported yet.")
-        elif args.arm == "R1":
-            logger_mp.warning("R1 arm is not supported yet.")
-            raise NotImplementedError("R1 arm is not supported yet.")
 
         # end-effector
         if args.ee == "dex3":

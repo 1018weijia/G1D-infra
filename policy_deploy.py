@@ -51,6 +51,7 @@ from teleop.utils.policy_handoff import (
     REPEAT_A,
     RESUME_POLICY as RESUME_POLICY_ACTION,
     ROLLBACK,
+    ROLLBACK_FROM_PHASES,
     START_POLICY as START_POLICY_ACTION,
     TAKEOVER,
     TELEOP_LIVE,
@@ -611,7 +612,7 @@ if __name__ == "__main__":
                         from_label, resume_error,
                     )
 
-            if ROLLBACK_REQUEST and RUN_PHASE in (POLICY_LIVE, TELEOP_LIVE):
+            if ROLLBACK_REQUEST and RUN_PHASE in ROLLBACK_FROM_PHASES:
                 ROLLBACK_REQUEST = False
                 policy_inference_enabled = False
                 invalidate_inference()

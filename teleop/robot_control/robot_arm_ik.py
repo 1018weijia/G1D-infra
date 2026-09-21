@@ -29,12 +29,20 @@ class G1_29_ArmIK:
         self.model_dir = _ASSETS_G1
         self.cache_path = os.path.join(_ASSETS_G1, "g1_29_model_cache.pkl")
 
-        # Try loading cache first
+        # Try loading cache first. The cache is a pickle of pinocchio models, so it is
+        # bound to the pinocchio build that wrote it; rebuild instead of crashing.
+        need_build = True
         if os.path.exists(self.cache_path):
             logger_mp.info(f"[G1_29_ArmIK] >>> Loading cached robot model: {self.cache_path}")
-            self.robot, self.reduced_robot = self.load_cache()
+            try:
+                self.robot, self.reduced_robot = self.load_cache()
+                need_build = False
+            except Exception as exc:
+                logger_mp.warning(f"[G1_29_ArmIK] >>> Cache unusable ({exc}); rebuilding from URDF.")
         else:
             logger_mp.info("[G1_29_ArmIK] >>> Cache not found. Loading URDF (slow)...")
+
+        if need_build:
             self.robot = pin.RobotWrapper.BuildFromURDF(self.urdf_path, self.model_dir)
 
             self.mixed_jointsToLockIDs = [
@@ -91,8 +99,8 @@ class G1_29_ArmIK:
                           pin.FrameType.OP_FRAME)
             )
             # Save cache (only after everything is built)
-            self.save_cache()
-            logger_mp.info(f"[G1_29_ArmIK]>>> Cache saved to {self.cache_path}")
+            if self.save_cache():
+                logger_mp.info(f"[G1_29_ArmIK]>>> Cache saved to {self.cache_path}")
 
         # Creating Casadi models and data for symbolic computing
         self.cmodel = cpin.Model(self.reduced_robot.model)
@@ -220,15 +228,21 @@ class G1_29_ArmIK:
         self.init_data = q.copy()
         self.smooth_filter.reset(q)
 
-    # Save both robot.model and reduced_robot.model
+    # Save both robot.model and reduced_robot.model. Best effort: the repo ships a
+    # cache that may not be writable by the current user, and that must not be fatal.
     def save_cache(self):
         data = {
             "robot_model": self.robot.model,
             "reduced_model": self.reduced_robot.model,
         }
 
-        with open(self.cache_path, "wb") as f:
-            pickle.dump(data, f)
+        try:
+            with open(self.cache_path, "wb") as f:
+                pickle.dump(data, f)
+        except OSError as exc:
+            logger_mp.warning(f"[G1_29_ArmIK] >>> Could not write cache {self.cache_path}: {exc}")
+            return False
+        return True
 
     # Load both robot.model and reduced_robot.model
     def load_cache(self):

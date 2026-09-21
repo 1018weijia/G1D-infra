@@ -3,10 +3,10 @@
 
 Usage:
   python upload_to_modelscope.py --token ms-xxx --repo user/pick_place_100 \\
-      --local-dir /home/unitree/data2lerobot/datasets/pick_place_100
+      --local-dir /home/unitree/g1d_infra/datasets/pick_place_100
 
   python upload_to_modelscope.py ms-xxx user/pick_place_100 \\
-      /home/unitree/data2lerobot/datasets/pick_place_100
+      /home/unitree/g1d_infra/datasets/pick_place_100
 
 Token can also come from MODELSCOPE_API_TOKEN / MODELSCOPE_TOKEN.
 If --repo is only a name (no owner/), the script prepends the token's username.
@@ -45,13 +45,13 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Examples:
   %(prog)s --token ms-xxxx --repo alice/pick_place_100 \\
-      --local-dir /home/unitree/data2lerobot/datasets/pick_place_100
+      --local-dir /home/unitree/g1d_infra/datasets/pick_place_100
 
   %(prog)s ms-xxxx alice/pick_place_100 \\
-      /home/unitree/data2lerobot/datasets/pick_place_100
+      /home/unitree/g1d_infra/datasets/pick_place_100
 
   MODELSCOPE_API_TOKEN=ms-xxxx %(prog)s --repo alice/pick_place_100 \\
-      --local-dir /home/unitree/data2lerobot/datasets/pick_place_100
+      --local-dir /home/unitree/g1d_infra/datasets/pick_place_100
 """,
     )
     parser.add_argument("positional", nargs="*", help=argparse.SUPPRESS)

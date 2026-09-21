@@ -5,9 +5,9 @@
 #   ./upload.sh --token ms-xxxx --repo username/pick_place_100 \
 #               --local-dir /home/unitree/g1d_infra/datasets/pick_place_100
 #   ./upload.sh ms-xxxx username/pick_place_100 \
-#               /home/unitree/data2lerobot/datasets/pick_place_100
+#               /home/unitree/g1d_infra/datasets/pick_place_100
 #   MODELSCOPE_API_TOKEN=ms-xxxx ./upload.sh --repo username/pick_place_100 \
-#               --local-dir ~/data2lerobot/datasets/pick_place_100
+#               --local-dir ~/g1d_infra/datasets/pick_place_100
 #
 # Token: ModelScope access token from https://www.modelscope.cn/my/myaccesstoken
 # Repo : username/dataset_name  (or just dataset_name; username is inferred)
@@ -50,10 +50,10 @@ Options:
 
 Examples:
   ./upload.sh --token ms-xxxx --repo alice/pick_place_100 \
-      --local-dir /home/unitree/data2lerobot/datasets/pick_place_100
+      --local-dir /home/unitree/g1d_infra/datasets/pick_place_100
 
   ./upload.sh ms-xxxx alice/pick_place_100 \
-      /home/unitree/data2lerobot/datasets/pick_place_100
+      /home/unitree/g1d_infra/datasets/pick_place_100
 EOF
 }
 

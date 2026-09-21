@@ -159,9 +159,15 @@ while [[ $# -gt 0 ]]; do
       SCHEMA_EPISODES="$2"
       shift 2
       ;;
-    --constants|--unitree-root)
+    --constants)
       CONSTANTS="$2"
       shift 2
+      ;;
+    --unitree-root)
+      echo "--unitree-root was removed; robot constants now come from this repo." >&2
+      echo "Default: ${SCRIPT_DIR}/constants.py" >&2
+      echo "To point elsewhere, pass a constants.py path: --constants PATH" >&2
+      exit 1
       ;;
     -h|--help)
       usage
