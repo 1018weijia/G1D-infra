@@ -1,0 +1,85 @@
+# G1-D policy inference config.
+# 16-dim absolute qpos [L7, LG, R7, RG], no normalization.
+# Cameras: head (top) + wrists (T-layout), stitch_mode=aspect, 384x320.
+# Action chunk: num_video_frames(8) * video_action_freq_ratio(8) = 64
+#   global_downsample_rate=1 -> 64 actions @30Hz = 2.13s.
+#
+# Checkpoint and cache paths below are placeholders. Fill them on the
+# inference server, not on the robot.
+
+common:
+  action_dim: 16
+  state_dim: 16
+
+  num_video_frames: 8
+  video_height: 384
+  video_width: 320
+
+  global_downsample_rate: 1
+  video_action_freq_ratio: 8   # action_chunk_size = 64
+
+dataset:
+  type: "g1d"
+  dataset_dir: ""
+
+  stitch_mode: "aspect"
+  action_mode: "qpos"
+
+  t5_mode: "disk_cache"
+  t5_cache_dir: "/path/to/t5_cache"
+  t5_text_len: 512
+  t5_device: "cuda"
+  allow_t5_cache_miss_zero: false
+
+  max_episodes: null
+  image_aug: false
+
+  params:
+    wan_path: "/path/to/pretrained_models"
+
+model:
+  wan:
+    checkpoint_path: "/path/to/wan"
+    config_path: "/path/to/wan"
+    vae_path: "/path/to/wan/vae.pth"
+    precision: "bfloat16"
+
+  vlm:
+    checkpoint_path: "/path/to/vlm"
+    precision: "bfloat16"
+    frozen: false
+
+  qwen3_expert:
+    vlm_dim: 2048
+    head_dim: 128
+    num_heads: 24
+    num_layers: 30
+    norm_eps: 1e-5
+
+  action_expert:
+    hidden_size: 1024
+    ffn_dim_multiplier: 4
+    norm_eps: 1e-5
+
+  time_distribution:
+    timestep_sample_method: "logit_normal"
+    sigmoid_scale: 1.0
+    min_t: 0.0
+    max_t: 1.0
+
+  training_mode: "finetune"
+
+  inference:
+    num_inference_timesteps: 10
+
+  loss_weights:
+    video_loss_weight: 1.0
+    action_loss_weight: 1.0
+
+  ema:
+    enabled: false
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
