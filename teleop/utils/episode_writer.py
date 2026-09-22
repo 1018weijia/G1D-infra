@@ -5,15 +5,23 @@ import datetime
 import numpy as np
 import time
 from .rerun_visualizer import RerunLogger
+from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
-from threading import Thread
+from threading import Lock, Thread
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
+# Queued behind the frames of the episode being closed, so the save runs once
+# every earlier frame is on disk and never depends on the queue happening to be
+# empty when the worker looks.
+_SAVE_SENTINEL = object()
+
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True,
+                 image_workers=4):
         """
         image_size: [width, height]
+        image_workers: parallel JPEG encoders; 4 matches the G1 camera count.
         """
         logger_mp.info("==> EpisodeWriter initializing...")
         self.task_dir = task_dir
@@ -56,6 +64,9 @@ class EpisodeWriter():
         self.item_data_queue = Queue(-1)
         self.stop_worker = False
         self.need_save = False  # Flag to indicate when save_episode is triggered
+        self._next_progress_log = 0.0
+        self._save_lock = Lock()
+        self.image_pool = ThreadPoolExecutor(max_workers=image_workers)
         self.worker_thread = Thread(target=self.process_queue)
         self.worker_thread.start()
 
@@ -123,8 +134,11 @@ class EpisodeWriter():
             f.write('"data": [\n')
         self.first_item = True   # Flag to handle commas in JSON array
 
-        if self.rerun_log:
-            self.online_logger = RerunLogger(prefix="online/", IdxRangeBoundary = 60, memory_limit="300MB")
+        # Do not build a RerunLogger here. create_episode() runs inside the 30 Hz
+        # control loop, and RerunLogger() calls rr.spawn(), which blocks ~3.7 s on
+        # a robot with no display. That stall freezes IK while the operator keeps
+        # moving, so the arm jumps when the loop resumes. _process_item_data logs
+        # through self.rerun_logger, built once in __init__.
 
         self.is_available = False  # After the episode is created, the class is marked as unavailable until the episode is successfully saved
         logger_mp.info(f"==> New episode created: {self.episode_dir}")
@@ -148,21 +162,50 @@ class EpisodeWriter():
         self.item_data_queue.put(item_data)
 
     def process_queue(self):
+        next_backlog_report = 0.0
         while not self.stop_worker or not self.item_data_queue.empty():
-            # Process items in the queue
             try:
                 item_data = self.item_data_queue.get(timeout=1)
-                try:
-                    self._process_item_data(item_data)
-                except Exception as e:
-                    logger_mp.info(f"Error processing item_data (idx={item_data['idx']}): {e}")
-                self.item_data_queue.task_done()
             except Empty:
-                pass
-        
-            # Check if save_episode was triggered
-            if self.need_save and self.item_data_queue.empty():
+                continue
+
+            if item_data is _SAVE_SENTINEL:
                 self._save_episode()
+                self.item_data_queue.task_done()
+                continue
+
+            try:
+                self._process_item_data(item_data)
+            except Exception as e:
+                logger_mp.info(f"Error processing item_data (idx={item_data['idx']}): {e}")
+            self.item_data_queue.task_done()
+
+            # A stop request cannot complete until the backlog drains, and the
+            # recorder stays busy until then, so report progress instead of
+            # letting the operator press the save key into silence.
+            pending = self.item_data_queue.qsize()
+            if self.need_save and pending > 1 and time.time() >= next_backlog_report:
+                logger_mp.info(f"==> Saving episode_{self.episode_id:04d}: {pending - 1} frames left to write")
+                next_backlog_report = time.time() + 1.0
+
+    def _save_image_group(self, idx, images, out_dir, rel_dir):
+        """Encode one frame's images in parallel and rewrite the dict to relative paths.
+
+        JPEG encoding is ~90% of the per-frame cost and cv2.imwrite releases the
+        GIL, so the four G1 cameras are written concurrently. Ordering across
+        frames still comes from the single worker thread.
+        """
+        if not images:
+            return
+        jobs = []
+        for key in list(images):
+            name = f'{str(idx).zfill(6)}_{key}.jpg'
+            jobs.append((key, name, os.path.join(out_dir, name), images[key]))
+        written = list(self.image_pool.map(lambda job: cv2.imwrite(job[2], job[3]), jobs))
+        for (key, name, path, _), ok in zip(jobs, written):
+            if not ok:
+                logger_mp.info(f"Failed to save image: {path}")
+            images[key] = os.path.join(rel_dir, name)
 
     def _process_item_data(self, item_data):
         idx = item_data['idx']
@@ -170,21 +213,8 @@ class EpisodeWriter():
         depths = item_data.get('depths', {})
         audios = item_data.get('audios', {})
 
-        # Save images
-        if colors:
-            for idx_color, (color_key, color) in enumerate(colors.items()):
-                color_name = f'{str(idx).zfill(6)}_{color_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.color_dir, color_name), color):
-                    logger_mp.info(f"Failed to save color image.")
-                item_data['colors'][color_key] = os.path.join('colors', color_name)
-
-        # Save depths
-        if depths:
-            for idx_depth, (depth_key, depth) in enumerate(depths.items()):
-                depth_name = f'{str(idx).zfill(6)}_{depth_key}.jpg'
-                if not cv2.imwrite(os.path.join(self.depth_dir, depth_name), depth):
-                    logger_mp.info(f"Failed to save depth image.")
-                item_data['depths'][depth_key] = os.path.join('depths', depth_name)
+        self._save_image_group(idx, colors, self.color_dir, 'colors')
+        self._save_image_group(idx, depths, self.depth_dir, 'depths')
 
         # Save audios
         if audios:
@@ -200,10 +230,14 @@ class EpisodeWriter():
             f.write(json.dumps(item_data, ensure_ascii=False, indent=4))
             self.first_item = False
 
-        # Log data if necessary
+        # Throttled progress. One rich-formatted log line per frame costs real
+        # time at 30 Hz and scrolls the useful messages off screen.
+        now = time.time()
+        if now >= self._next_progress_log:
+            logger_mp.info(f"==> episode_{self.episode_id:04d}: wrote {idx + 1} frames")
+            self._next_progress_log = now + 1.0
+
         if self.rerun_log:
-            curent_record_time = time.time()
-            logger_mp.info(f"==> episode_id:{self.episode_id}  item_id:{idx}  current_time:{curent_record_time}")
             self.rerun_logger.log_item_data(item_data)
 
     def save_episode(self, success=None):
@@ -214,27 +248,35 @@ class EpisodeWriter():
             success: True/False to label the episode. None keeps the current label
                      so close() can finish a pending save without overwriting it.
         """
-        if success is not None:
-            self.success = bool(success)
-        self.need_save = True  # Set the save flag
-        logger_mp.info(f"==> Episode saved start... success={self.success}")
+        with self._save_lock:
+            if success is not None:
+                self.success = bool(success)
+            if self.is_available or self.need_save:
+                # No episode is open, or a save is already queued. Queueing a
+                # second sentinel would close the same JSON array twice.
+                return
+            self.need_save = True
+            pending = self.item_data_queue.qsize()
+            self.item_data_queue.put(_SAVE_SENTINEL)
+        logger_mp.info(f"==> Episode saved start... success={self.success}, {pending} frames queued")
 
     def _save_episode(self):
         """
-        Save the episode data to a JSON file.
+        Save the episode data to a JSON file. Runs on the worker thread only.
         """
-        with open(self.json_path, "a", encoding="utf-8") as f:
-            f.write("\n],\n")
-            f.write('"success": ' + json.dumps(bool(self.success)) + "\n}")
+        with self._save_lock:
+            with open(self.json_path, "a", encoding="utf-8") as f:
+                f.write("\n],\n")
+                f.write('"success": ' + json.dumps(bool(self.success)) + "\n}")
 
-        if not self.success:
-            failed_marker = os.path.join(self.episode_dir, "FAILED")
-            with open(failed_marker, "w", encoding="utf-8") as f:
-                f.write("failed\n")
-            logger_mp.info(f"==> Episode marked as failed: {self.episode_dir}")
+            if not self.success:
+                failed_marker = os.path.join(self.episode_dir, "FAILED")
+                with open(failed_marker, "w", encoding="utf-8") as f:
+                    f.write("failed\n")
+                logger_mp.info(f"==> Episode marked as failed: {self.episode_dir}")
 
-        self.need_save = False     # Reset the save flag
-        self.is_available = True   # Mark the class as available after saving
+            self.need_save = False     # Reset the save flag
+            self.is_available = True   # Mark the class as available after saving
         logger_mp.info(f"==> Episode saved successfully to {self.json_path}.")
 
     def close(self):
@@ -248,3 +290,4 @@ class EpisodeWriter():
             time.sleep(0.01)
         self.stop_worker = True
         self.worker_thread.join()
+        self.image_pool.shutdown(wait=True)

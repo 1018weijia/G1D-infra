@@ -7,7 +7,32 @@ import rerun.blueprint as rrb
 from datetime import datetime
 import numpy as np
 from numbers import Number
+import logging_mp
 os.environ["RUST_LOG"] = "error"
+
+logger_mp = logging_mp.getLogger(__name__)
+
+
+def viewer_can_start(env=None):
+    """Whether rr.spawn() has a chance of launching a viewer."""
+    env = os.environ if env is None else env
+    return bool(env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"))
+
+
+def should_log_to_rerun(requested, headless=False, env=None):
+    """Decide whether an EpisodeWriter should stream to Rerun.
+
+    Logging is opt-in because RerunLogger calls rr.spawn(). With no display that
+    call still costs ~3.7 s before giving up, and it runs inside the 30 Hz
+    control loop, so the arm jumps when the loop resumes. Streaming also adds
+    ~12 ms per frame, enough to make the writer fall behind a 30 Hz recording.
+    """
+    if not requested or headless:
+        return False
+    if viewer_can_start(env):
+        return True
+    logger_mp.warning("Rerun logging disabled: no DISPLAY/WAYLAND_DISPLAY, the viewer cannot start here.")
+    return False
 
 class RerunEpisodeReader:
     def __init__(self, task_dir = ".", json_file="data.json"):

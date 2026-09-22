@@ -23,6 +23,8 @@ UNITREE_DDSINTERFACE=eth0 python collect.py \
 
 录制默认开启。想只遥操作、不写盘（练手或调试）加 `--no-record`。
 
+Rerun 可视化默认关闭，要用加 `--rerun`，且机器上得有 `DISPLAY`。它会在每次开始录制时阻塞主循环约 3.7 秒（机械臂会跳变），每帧再多花约 12 毫秒；没有显示器时自动忽略。
+
 环境变量：`EE`、`INPUT_MODE`、`TASK_DIR`、`TASK_NAME`、`TASK_GOAL`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`。
 
 启动前不要同时跑其他机械臂控制程序。图像服务需已在 `192.168.123.164`（可用 `IMAGE_HOST` 覆盖）。

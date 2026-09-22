@@ -30,6 +30,7 @@ from teleop.utils.instruction_map import ControlDataMapper, HandleInstruction
 
 from teleop.teleimager.src.teleimager.image_client import ImageClient
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.rerun_visualizer import should_log_to_rerun
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.controller_shortcuts import ControllerShortcutMapper, toggle_start_pause
 # from teleop.utils.motion_switcher import MotionSwitcher
@@ -129,6 +130,7 @@ if __name__ == '__main__':
     parser.add_argument('--use-waist', action = 'store_true', help = 'Enable waist control')
     # mode flags
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
+    parser.add_argument('--rerun', action='store_true', help='Stream episodes to a Rerun viewer (needs a display; off by default)')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server')
@@ -303,7 +305,7 @@ if __name__ == '__main__':
                                      task_desc = args.task_desc,
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
-                                     rerun_log = not args.headless)
+                                     rerun_log = should_log_to_rerun(args.rerun, args.headless))
 
         logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
         logger_mp.info("Controller shortcuts: right A=start/pause/resume, left Y=record toggle, left X=fail-stop, right B=quit")
