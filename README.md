@@ -49,3 +49,4 @@ git submodule update --init --recursive
 
 - [GUIDE_COLLECT.md](GUIDE_COLLECT.md) 单人数采
 - [GUIDE_DEPLOY.md](GUIDE_DEPLOY.md) policy 回退与对齐接管
+- [TESTING.md](TESTING.md) 验收测试（L0–L3 无需硬件，L4–L5 上机）
