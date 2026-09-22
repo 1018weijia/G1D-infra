@@ -18,6 +18,10 @@ dataset and tagged on every frame as:
   - complementary_info.is_bad   True if the source episode is in the bad list
   - next.success                False if the source episode is in the bad list
   - complementary_info.source_episode_index   original episode_XXXX number
+
+The bad list is the union of what collect.py already recorded (a FAILED marker
+file, or "success": false in data.json) and whatever --bad-episodes adds. Pass
+--no-auto-bad to use only the explicit list.
 """
 
 from __future__ import annotations
@@ -219,6 +223,41 @@ def source_episode_id(episode_dir: Path) -> int | None:
     if match is None:
         return None
     return int(match.group(1))
+
+
+FAILED_MARKER = "FAILED"
+SUCCESS_TAIL_BYTES = 256
+_SUCCESS_RE = re.compile(rb'"success"\s*:\s*(true|false)')
+
+
+def episode_marked_failed(episode_dir: Path) -> bool:
+    """True when collect.py labelled this episode a failure.
+
+    EpisodeWriter writes both a FAILED marker file and a top-level
+    "success": false at the end of data.json. The marker is cheap, so it is
+    checked first; the JSON tail covers episodes recorded before the marker
+    existed. Only the tail is read, to keep this O(1) per episode.
+    """
+    if (episode_dir / FAILED_MARKER).exists():
+        return True
+    try:
+        with (episode_dir / "data.json").open("rb") as handle:
+            handle.seek(0, 2)
+            handle.seek(max(0, handle.tell() - SUCCESS_TAIL_BYTES))
+            tail = handle.read()
+    except OSError:
+        return False
+    matches = _SUCCESS_RE.findall(tail)
+    return bool(matches) and matches[-1] == b"false"
+
+
+def detect_failed_episode_ids(episode_dirs: Iterable[Path]) -> set[int]:
+    ids: set[int] = set()
+    for episode_dir in episode_dirs:
+        source_id = source_episode_id(episode_dir)
+        if source_id is not None and episode_marked_failed(episode_dir):
+            ids.add(source_id)
+    return ids
 
 
 def discover_episode_dirs(raw_dir: Path) -> list[Path]:
@@ -453,10 +492,10 @@ def convert(args: argparse.Namespace) -> None:
     output_dir = args.output_dir.expanduser().resolve()
     episode_dirs = discover_episode_dirs(raw_dir)
 
-    bad_ids = parse_episode_ids(args.bad_episodes)
-    bad_ids |= load_bad_ids_from_file(args.bad_episodes_file)
+    explicit_bad_ids = parse_episode_ids(args.bad_episodes)
+    explicit_bad_ids |= load_bad_ids_from_file(args.bad_episodes_file)
     source_ids = {source_episode_id(p) for p in episode_dirs}
-    unknown_bad = sorted(i for i in bad_ids if i not in source_ids)
+    unknown_bad = sorted(i for i in explicit_bad_ids if i not in source_ids)
     if unknown_bad:
         raise ValueError(
             "These bad episode ids were not found in the input folder: "
@@ -465,6 +504,13 @@ def convert(args: argparse.Namespace) -> None:
 
     if args.max_episodes is not None:
         episode_dirs = episode_dirs[: args.max_episodes]
+
+    auto_bad_ids = detect_failed_episode_ids(episode_dirs) if args.auto_bad else set()
+    bad_ids = explicit_bad_ids | auto_bad_ids
+    if auto_bad_ids:
+        print(f"Auto-detected failed episodes (FAILED marker or success=false): {sorted(auto_bad_ids)}")
+    elif args.auto_bad:
+        print("Auto-detected failed episodes: none")
 
     cv2.setNumThreads(1)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -628,6 +674,8 @@ def convert(args: argparse.Namespace) -> None:
             "image_load_workers": args.image_load_workers,
         },
         "bad_source_episodes": sorted(bad_ids),
+        "explicit_bad_episodes": sorted(explicit_bad_ids),
+        "auto_detected_bad_episodes": sorted(auto_bad_ids),
         "converted_episodes": converted,
         "tagged_bad_episodes": tagged_bad,
         "skipped_bad_episodes": skipped_bad,
@@ -659,6 +707,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bad source episode numbers, e.g. --bad-episodes '7,15,23' or --bad-episodes 7 --bad-episodes 15",
     )
     parser.add_argument("--bad-episodes-file", type=Path, default=None, help="Optional file with one id per line")
+    parser.add_argument(
+        "--auto-bad",
+        dest="auto_bad",
+        action="store_true",
+        default=True,
+        help="Also treat episodes with a FAILED marker or success=false as bad (default).",
+    )
+    parser.add_argument(
+        "--no-auto-bad",
+        dest="auto_bad",
+        action="store_false",
+        help="Use only --bad-episodes / --bad-episodes-file.",
+    )
     parser.add_argument("--skip-bad", action="store_true", help="Drop bad episodes instead of converting+tagging them")
     parser.add_argument("--task", type=str, default=None, help="Override language task; default uses JSON text.goal")
     parser.add_argument("--fps", type=int, default=30)

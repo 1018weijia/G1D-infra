@@ -7,17 +7,21 @@
 #                --output-dir ~/g1d_infra/datasets/pick_place_100
 #   ./convert.sh --bad 7,15,23
 #   ./convert.sh --skip-bad          # drop bad episodes instead of tagging them
+#   ./convert.sh --no-auto-bad       # ignore FAILED markers, trust the list only
 #
-# Fill BAD_EPISODES below, then run the script. Numbers match episode_XXXX
-# folders: episode_0007 -> 7.
+# Episodes that collect.py already labelled failed (a FAILED marker file, or
+# "success": false in data.json) are detected automatically. BAD_EPISODES and
+# --bad are for the ones you decide are bad after the fact. Numbers match
+# episode_XXXX folders: episode_0007 -> 7.
 
 set -euo pipefail
 
 # =============================================================================
-# 坏轨迹列表（必填位置）
-# 填写采集目录里的轨迹序号，对应 episode_XXXX 文件夹的数字。
+# 坏轨迹列表（补充用）
+# 采集时按左 X 标记失败的轨迹会被自动识别，不用写在这里。
+# 这里填事后才判定为坏的轨迹序号，对应 episode_XXXX 文件夹的数字。
 # 例：episode_0007、episode_0015 写成 7 15 或 7,15
-# 留空表示全部标为好数据。
+# 留空表示除自动识别出的失败轨迹外，其余都算好数据。
 # =============================================================================
 BAD_EPISODES=""
 
@@ -26,6 +30,7 @@ OUTPUT="${HOME}/g1d_infra/datasets/pick_place_100"
 ROBOT_TYPE="Unitree_G1_MoveibleLift_Dex1_NoUseWaist"
 TASK=""
 SKIP_BAD=0
+AUTO_BAD=1
 OVERWRITE=1
 IMAGE_WRITER_THREADS=""
 IMAGE_WRITER_PROCESSES=""
@@ -61,7 +66,8 @@ Options:
   --output-dir PATH             LeRobot dataset output dir
   --constants PATH              robot constants.py (default: this directory)
   --robot-type NAME             robot_type key in constants.py
-  --bad IDS                     bad episode numbers, e.g. 7,15 or "7 15"
+  --bad IDS                     extra bad episode numbers, e.g. 7,15 or "7 15"
+  --no-auto-bad                 ignore FAILED markers; use --bad only
   --task TEXT                   override language instruction
   --skip-bad                    do not convert bad episodes
   --no-overwrite                fail if output already exists
@@ -77,7 +83,8 @@ Options:
   -h, --help                    show this help
 
 --input/--output are aliases for --raw-dir/--output-dir.
-Edit BAD_EPISODES at the top of this script to keep a persistent bad list.
+Episodes labelled failed during collection are picked up automatically.
+Edit BAD_EPISODES at the top of this script to keep a persistent extra list.
 EOF
 }
 
@@ -105,6 +112,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-bad)
       SKIP_BAD=1
+      shift
+      ;;
+    --auto-bad)
+      AUTO_BAD=1
+      shift
+      ;;
+    --no-auto-bad)
+      AUTO_BAD=0
       shift
       ;;
     --no-overwrite)
@@ -230,6 +245,10 @@ if [[ "${SKIP_BAD}" -eq 1 ]]; then
   CMD+=(--skip-bad)
 fi
 
+if [[ "${AUTO_BAD}" -eq 0 ]]; then
+  CMD+=(--no-auto-bad)
+fi
+
 if [[ "${OVERWRITE}" -eq 1 ]]; then
   CMD+=(--overwrite)
 fi
@@ -284,7 +303,7 @@ echo "Input : ${INPUT}"
 echo "Output: ${OUTPUT}"
 echo "Robot : ${ROBOT_TYPE}"
 echo "Python: ${PYTHON_BIN}"
-echo "Bad   : ${BAD_EPISODES:-<none>}"
+echo "Bad   : ${BAD_EPISODES:-<none>} (auto-detect: $([[ "${AUTO_BAD}" -eq 1 ]] && echo on || echo off))"
 echo
 
 exec "${CMD[@]}"

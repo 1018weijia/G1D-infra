@@ -51,7 +51,7 @@ UNITREE_DDSINTERFACE=eth0 python collect.py \
   FAILED          # 仅失败轨迹存在
 ```
 
-`data.json` 顶层有 `"success": true/false`。失败轨迹另写 `FAILED` 文件，转换时用 `--bad` 标坏数据。
+`data.json` 顶层有 `"success": true/false`。失败轨迹另写 `FAILED` 文件。转换时这两个标记都会被自动识别，不用手工再列一遍；`--bad` 只用来补充事后才判定为坏的轨迹。
 
 ## 之后
 
@@ -59,7 +59,7 @@ UNITREE_DDSINTERFACE=eth0 python collect.py \
 cd ~/g1d_infra/data_convert
 ./convert.sh --raw-dir ~/unitree_eai_environment/data/pick_place \
              --output-dir ~/g1d_infra/datasets/pick_place \
-             --bad 3,7
+             --bad 3,7      # 可选：采集时没标、事后才看出来的坏轨迹
 ./upload.sh --token "$MODELSCOPE_API_TOKEN" --repo owner/pick_place \
             --local-dir ~/g1d_infra/datasets/pick_place
 ```
