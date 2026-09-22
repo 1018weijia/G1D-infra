@@ -8,7 +8,7 @@ import termios
 import threading
 import time
 import tty
-from multiprocessing import Array, Lock, Value
+from multiprocessing import Array
 
 import numpy as np
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
@@ -27,11 +27,11 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from teleop.robot_control.robot_arm import G1_29_Arm_Internal_Dex1_Controller
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 from teleop.teleimager.src.teleimager.image_client import ImageClient
 from teleop.utils.alignment import ACTIVE, ALIGNED, DualArmAlignment
 from teleop.utils.alignment_config import load_targets
+from teleop.utils.dex1_arm_bundle import create_dex1_arm_controller
 from teleop.utils.ego_projection import EgoPixelOverlay
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.handoff_utils import rollback_endpoint_to_xr_targets
@@ -70,6 +70,7 @@ from teleop.utils.policy_handoff import (
     stale_key_flags,
 )
 from teleop.utils.rollback import PolicyRollbackBuffer
+from teleop.utils.ready_pose import ReadyPoseError, load_ready_pose, move_to_ready_pose
 
 STOP = False
 START_POLICY = False
@@ -308,6 +309,15 @@ if __name__ == "__main__":
     parser.add_argument("--ego-pixel-overlay", action="store_true")
     parser.add_argument("--policy-prefetch-steps", type=int, default=4,
                         help="Request the next chunk when this many actions remain")
+    parser.add_argument(
+        "--ready-pose-config",
+        default=os.path.join(REPO_ROOT, "configs", "ready_pose.json"),
+        help="14-joint raised startup pose shared with replay",
+    )
+    parser.add_argument(
+        "--ready-pose-seconds", type=float, default=3.0,
+        help="seconds to move from the current pose to the raised startup pose",
+    )
     parser.add_argument("--swap-wrists", action="store_true", default=True)
     parser.add_argument("--no-swap-wrists", action="store_false", dest="swap_wrists")
     parser.add_argument(
@@ -335,6 +345,14 @@ if __name__ == "__main__":
         parser.error("--alignment-handoff-max-joint-speed must be positive")
     if args.policy_prefetch_steps < 0:
         parser.error("--policy-prefetch-steps must be non-negative")
+    if args.frequency <= 0.0:
+        parser.error("--frequency must be positive")
+    if args.ready_pose_seconds <= 0.0:
+        parser.error("--ready-pose-seconds must be positive")
+    try:
+        ready_pose_q = load_ready_pose(args.ready_pose_config)
+    except ReadyPoseError as error:
+        parser.error(str(error))
 
     from teleop.televuer.tv_wrapper import TeleVuerWrapper
 
@@ -400,18 +418,11 @@ if __name__ == "__main__":
             alignment_state_shared=alignment_state_shared,
         )
 
-        xr_motion_data_ready = Value("b", False, lock=True)
-        left_gripper_value = Value("d", 0.0, lock=True)
-        right_gripper_value = Value("d", 0.0, lock=True)
-        dual_gripper_data_lock = Lock()
-        dual_gripper_state_array = Array("d", 2, lock=False)
-        dual_gripper_action_array = Array("d", 2, lock=False)
-        arm_ctrl = G1_29_Arm_Internal_Dex1_Controller(
-            left_gripper_value, right_gripper_value, dual_gripper_data_lock,
-            dual_gripper_state_array, dual_gripper_action_array,
-            simulation_mode=False, use_waist=False,
-            xr_motion_data_ready_in=xr_motion_data_ready,
-        )
+        bundle = create_dex1_arm_controller(simulation_mode=False, use_waist=False)
+        arm_ctrl = bundle.arm_ctrl
+        xr_motion_data_ready = bundle.xr_motion_data_ready
+        left_gripper_value = bundle.left_gripper_value
+        right_gripper_value = bundle.right_gripper_value
         arm_ik = G1_29_ArmIK()
 
         hold_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
@@ -592,12 +603,34 @@ if __name__ == "__main__":
 
             if START_POLICY and RUN_PHASE == POLICY_IDLE:
                 START_POLICY = False
-                action_queue = prefetched_queue.copy()
+                logger_mp.info(
+                    "Moving both arms to the raised ready pose before policy startup (%.1fs).",
+                    args.ready_pose_seconds,
+                )
+                ready_result = move_to_ready_pose(
+                    arm_ctrl,
+                    arm_ik,
+                    ready_pose_q,
+                    args.ready_pose_seconds,
+                    args.frequency,
+                    grippers=(last_left_grip, last_right_grip),
+                    stop_requested=lambda: STOP,
+                )
+                last_arm_q = ready_result.arm_q.copy()
+                last_tau = ready_result.tau.copy()
+                if not ready_result.completed:
+                    logger_mp.warning("Ready-pose reset interrupted; policy was not started.")
+                    if STOP:
+                        break
+                    continue
+                action_queue = []
                 prefetched_queue = []
                 policy_inference_enabled = True
                 RUN_PHASE = POLICY_LIVE
                 recording = _start_record_episode(args, recorder, recording)
-                logger_mp.info("Policy rollout started; requesting first action chunk.")
+                logger_mp.info(
+                    "Ready pose reached; policy rollout started and is requesting the first chunk."
+                )
 
             if ((START_POLICY and RUN_PHASE == ALIGNING) or
                     (RESUME_POLICY and RUN_PHASE == TELEOP_LIVE)):

@@ -8,9 +8,9 @@
 |---|---|---|---|
 | L0 | 环境自检 | 否 | ~30 s |
 | L1 | 单元测试 | 否 | ~5 s |
-| L2 | 采集格式 → LeRobot 转换 → 上传（假数据） | 否 | ~40 s |
+| L2 | 采集格式 → LeRobot 转换 → 上传 → 重放校验（假数据） | 否 | ~60 s |
 | L3 | 推理通信链路（mock 推理服务） | 否 | ~10 s |
-| L4 | 实机数采 | 是 | ~15 min |
+| L4 | 实机数采 + 轨迹重放 | 是 | ~20 min |
 | L5 | 实机 policy 回退与接管 | 是 + GPU 机 | ~30 min |
 
 记录结果用文末的[验收表](#验收记录表)。
@@ -67,7 +67,7 @@ python tests/check_env.py
 
 ## L1 单元测试
 
-56 个无硬件依赖的用例，覆盖对齐状态机、回退缓冲、接管按键防抖、episode 失败标记与坏轨迹识别、录制写盘吞吐、动作 chunk 校验。
+89 个无硬件依赖的用例，覆盖准备姿势、对齐状态机、回退缓冲、接管按键防抖、episode 失败标记与坏轨迹识别、录制写盘吞吐、轨迹重放校验、动作 chunk 校验。
 
 ```bash
 cd ~/g1d_infra
@@ -79,7 +79,7 @@ python -m unittest discover -s tests -v
 **成功标志**
 
 ```text
-Ran 56 tests in 10.228s
+Ran 89 tests in 10.321s
 
 OK
 ```
@@ -91,6 +91,7 @@ OK
 | 用例 | 保证什么 |
 |---|---|
 | `test_rollback_hold_uses_last_command_not_measured_state` | 回退播完后 hold 的是最后一拍命令，不是实测关节角。挂了会导致机械臂从回退终点抽回去 |
+| `test_move_commands_target_and_preserves_grippers` | 准备段准确到达抬手姿势，并且不会误开合夹爪 |
 | `test_a_takeover_then_held_repeat_does_not_resume` | 按住 A 不会被当成「接管 + 立刻交回」 |
 | `test_a_ignored_until_rollback` | 没回退就按 A 不接管 |
 | `test_tracking_loss_holds_and_reanchor_restarts_blend` | tracking 掉了保持不动，恢复后重新 blend |
@@ -269,7 +270,52 @@ Dry run only. No upload.
 
 要测真上传，把 `--token` 换成 [ModelScope access token](https://www.modelscope.cn/my/myaccesstoken)、`--repo` 换成自己的仓库、去掉 `--dry-run`。成功后去网页端确认文件数和上面列出的一致。
 
-### L2.4 清理
+### L2.4 重放校验（不碰机器人）
+
+`python -m teleop.replay --dry-run` 只加载、校验、打印摘要，正好可以拿假数据验证重放的解析和安全检查。
+
+```bash
+cd ~/g1d_infra
+python -m teleop.replay --data-json /tmp/g1d_fake/fake_task/episode_0000 --dry-run
+python -m teleop.replay --data-json /tmp/g1d_fake/fake_task/episode_0001 --dry-run | grep label
+```
+
+**成功标志**
+
+- `episode_0000`：`label   : success`、`checks  : ok`、结尾 `dry run, robot untouched`。
+- `episode_0001`：`label   : this episode is marked FAILED`。
+- 两条都是 `frames  : 20`、`playback: 30.0 Hz`。
+
+再确认坏数据会被挡下来：
+
+```bash
+python - <<'PY'
+import json, numpy as np, os
+os.makedirs('/tmp/g1d_fake/jump/episode_0000', exist_ok=True)
+blk = lambda l, r: {'left_arm': {'qpos': list(l)}, 'right_arm': {'qpos': list(r)},
+                    'left_ee': {'qpos': [1.0]}, 'right_ee': {'qpos': [1.0]}}
+data = []
+for i in range(30):
+    l = np.full(7, i * 0.01)
+    if i == 15:
+        l = l + 1.2                      # 注入一个 1.2 rad 的跳变
+    data.append({'idx': i, 'colors': {}, 'states': blk(l, -l), 'actions': blk(l, -l)})
+json.dump({'info': {'image': {'fps': 30.0}}, 'text': {}, 'data': data},
+          open('/tmp/g1d_fake/jump/episode_0000/data.json', 'w'))
+PY
+python -m teleop.replay --data-json /tmp/g1d_fake/jump/episode_0000 --dry-run; echo "exit=$?"
+```
+
+**成功标志**：退出码 2，并指到具体帧——
+
+```text
+UNSAFE  : arm joint 0 jumps 1.210 rad between frames 14 and 15, over the 0.25 rad limit
+refusing to replay this episode. ...
+```
+
+这条是重放最重要的护栏：损坏或拼接错的轨迹绝不能下发到机械臂。
+
+### L2.5 清理
 
 ```bash
 rm -rf /tmp/g1d_fake
@@ -470,6 +516,30 @@ cd ~/g1d_infra
 
 **成功标志**：`Auto-detected failed episodes ...: [1]`、`Converted 2 episodes, tagged bad=1`，且 `meta/episode_quality.json` 里 `(1, True)`。这一步是在真实数据上验证 L2.2b 的自动识别——采数时按的左 X 一路传到了数据集标签。
 
+### L4.5 重放刚采的轨迹
+
+把 L4.3 采的第一条在机器人上开环放一遍。这是「采到的数据能不能真的驱动机器人」的闭环验证。
+
+**机械臂会自己动。清空工作区，手放急停上。**先半速：
+
+```bash
+cd ~/g1d_infra
+./scripts/run_replay.sh /tmp/g1d_test_data/smoke_test/episode_0000 --dry-run
+./scripts/run_replay.sh /tmp/g1d_test_data/smoke_test/episode_0000 --speed 0.5
+```
+
+| 阶段 | 预期 |
+|---|---|
+| dry-run | `checks  : ok`，`frames` 与 L4.3 一致 |
+| 确认提示 | 打印 `ready` 和 `approach` 两段的最大关节差，差值过大就先手动把机器人摆近些 |
+| 准备段 | 约 3 秒平滑移到双手抬起准备姿势，稳定后才继续 |
+| 接近段 | 再用约 3 秒从准备姿势平滑移到第一帧，**不跳变** |
+| 重放段 | 双臂复现录制动作，夹爪开合时机与录制一致 |
+| 中途按 `Q` / Ctrl+C | 停住后 hold 约 1 秒，再回 home 放下双臂 |
+| 结束 | hold 1 秒后回 home 放下 |
+
+**成功标志**：全程无跳变、无急停触发，动作轨迹肉眼看与录制时一致。确认无误后再用 `--speed 1.0` 全速跑一遍。
+
 ```bash
 rm -rf /tmp/g1d_test_data /tmp/g1d_test_out
 ```
@@ -553,16 +623,18 @@ INSTRUCTION="pick up the red cup" \
 | 级别 | 项目 | 结果 | 备注 |
 |---|---|---|---|
 | L0 | `tests/check_env.py` 全 PASS | ☐ | |
-| L1 | 56 个单元测试 `OK` | ☐ | |
+| L1 | 89 个单元测试 `OK` | ☐ | |
 | L2.1 | 3 条假 episode，1 条带 `FAILED` | ☐ | |
 | L2.2 | `Converted 3 episodes, tagged bad=1`，v3.0 目录完整 | ☐ | |
 | L2.2b | 坏轨迹三种模式结果为 `[1]` / `[1,2]` / `[]` | ☐ | |
 | L2.3 | 上传 `--dry-run` 列出 10 个文件 | ☐ | |
+| L2.4 | 重放 dry-run 通过，跳变数据被拒（退出码 2） | ☐ | |
 | L3 | `roundtrip OK`，帧 384×320、chunk (64,16) | ☐ | |
 | L4.1 | 相机服务三路可达 | ☐ | |
 | L4.2 | `--no-record` 遥操作跟手，A/B 键正常 | ☐ | |
 | L4.3 | 两条 episode，成功/失败标记正确 | ☐ | |
 | L4.4 | 实采数据转换通过 | ☐ | |
+| L4.5 | 实采轨迹重放，接近段与重放段均无跳变 | ☐ | |
 | L5.1 | 隧道建立、policy 服务探测通过 | ☐ | |
 | L5.2 | 状态机 10 步全过 | ☐ | |
 | L5.3 | tracking 丢失时保持不动 | ☐ | |
@@ -576,3 +648,4 @@ INSTRUCTION="pick up the red cup" \
 - [README.md](README.md) 仓库总览
 - [GUIDE_COLLECT.md](GUIDE_COLLECT.md) 数采操作细节与按键表
 - [GUIDE_DEPLOY.md](GUIDE_DEPLOY.md) 状态机、按键、对齐参数
+- [GUIDE_REPLAY.md](GUIDE_REPLAY.md) 轨迹重放参数与安全校验

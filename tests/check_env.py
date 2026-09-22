@@ -27,6 +27,10 @@ REPO_MODULES = [
     "teleop.utils.rollback",
     "teleop.utils.alignment",
     "teleop.utils.handoff_utils",
+    "teleop.utils.ready_pose",
+    "teleop.utils.trajectory_replay",
+    "teleop.utils.dex1_arm_bundle",
+    "teleop.replay",
     "teleop.robot_control.robot_arm_ik",
     "teleop.televuer.tv_wrapper",
 ]
@@ -34,8 +38,10 @@ REPO_MODULES = [
 REQUIRED_PATHS = [
     "collect.py",
     "policy_deploy.py",
+    "teleop/replay.py",
     "configs/infer_g1d.yaml",
     "configs/alignment_targets.json",
+    "configs/ready_pose.json",
     "assets/g1_D/g1_d.urdf",
     "data_convert/convert.sh",
     "data_convert/upload.sh",
@@ -73,9 +79,9 @@ def import_in_subprocess(name, timeout=180):
     return proc.returncode == 0, last_line(proc.stderr)
 
 
-def help_runs(script, timeout=180):
+def help_runs(args, timeout=180):
     proc = subprocess.run(
-        [sys.executable, script, "--help"],
+        [sys.executable, *args, "--help"],
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=timeout,
     )
     return proc.returncode == 0, last_line(proc.stderr)
@@ -107,8 +113,12 @@ def main():
             report.check(name, *import_in_subprocess(name))
 
     print("\n-- entrypoints --")
-    for script in ("collect.py", "policy_deploy.py"):
-        report.check(f"{script} --help", *help_runs(script))
+    for label, argv in (
+        ("collect.py", ["collect.py"]),
+        ("policy_deploy.py", ["policy_deploy.py"]),
+        ("teleop.replay", ["-m", "teleop.replay"]),
+    ):
+        report.check(f"{label} --help", *help_runs(argv))
 
     print("\n-- conversion environment (optional on the robot) --")
     if not os.path.exists(args.convert_python):

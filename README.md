@@ -10,6 +10,7 @@ G1-D 上的单人数采、LeRobot 转换上传、以及 policy 部署（含回�
 |---|---|---|
 | `collect.py` / `scripts/run_collect.sh` | XR 遥操作录制 episode（默认录制，`--no-record` 关） | 不回退、不接管、不对齐 |
 | `policy_deploy.py` / `scripts/run_deploy.sh` | 云端 policy 推理、B 回退最近几秒、手柄坐标轴对齐后 A 接管 | 不负责日常采数 |
+| `teleop.replay` / `scripts/run_replay.sh` | 开环重放一条录好的 episode（双臂 + 夹爪） | 不放底盘升降、不放图像 |
 
 数据流：
 
@@ -27,6 +28,7 @@ policy_deploy.py  <-  远端推理服务（SSH 隧道 + ZMQ/WebSocket）
 | `teleop/` | XR、IK、DDS、相机、对齐、回退、推理客户端 |
 | `collect.py` | 单人数采 |
 | `policy_deploy.py` | policy 部署 + 回退 + 对齐接管 |
+| `teleop/replay.py` | 录制轨迹开环重放 |
 | `configs/infer_g1d.yaml` | 推理配置（结构完整，路径为占位） |
 | `configs/alignment_targets.json` | 对齐目标位姿 |
 | `data_convert/` | JSON → LeRobot v3.0，以及 ModelScope 上传 |
@@ -49,4 +51,5 @@ git submodule update --init --recursive
 
 - [GUIDE_COLLECT.md](GUIDE_COLLECT.md) 单人数采
 - [GUIDE_DEPLOY.md](GUIDE_DEPLOY.md) policy 回退与对齐接管
+- [GUIDE_REPLAY.md](GUIDE_REPLAY.md) 轨迹开环重放
 - [TESTING.md](TESTING.md) 验收测试（L0–L3 无需硬件，L4–L5 上机）

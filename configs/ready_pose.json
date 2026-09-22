@@ -1,0 +1,19 @@
+{
+  "description": "G1-D dual-arm raised ready pose captured from a verified teleoperation startup command. Joint order is left arm 7, then right arm 7.",
+  "arm_q": [
+    0.3280082345,
+    -0.0444015563,
+    -0.0210323147,
+    -0.2193952054,
+    -0.1763718426,
+    -0.3590713441,
+    -0.1322099715,
+    0.1631669253,
+    -0.0210245643,
+    0.1643322706,
+    -0.1186949760,
+    -0.1611172855,
+    -0.2666637003,
+    -0.2119511217
+  ]
+}
