@@ -25,6 +25,9 @@ REWIND_TERMINAL_REWARD = -0.2
 REWIND_PREFIX_REWARD = 0.1
 PROGRESS_REWARD = 0.5
 SUCCESS_REWARD = 1.0
+# The robot uplink is about 1 Mbit/s. A raw 384x320 frame is 369 KB, JPEG q90
+# is about 20 KB, so a 64-step transition drops from ~24 MB to ~1.3 MB.
+JPEG_QUALITY = 90
 # Same reorder as PolicyAdapter: raw [L7, R7, LG, RG] -> [L7, LG, R7, RG].
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
 # Residual actor can push a gripper slightly past the SFT 5.5 safety cap.
@@ -71,13 +74,24 @@ def chunk_rewards(length: int, outcome: Optional[str]) -> np.ndarray:
     return rewards
 
 
-def observation_zmq(frame_rgb: np.ndarray, state: np.ndarray, prompt: str) -> dict:
+def encode_jpeg_rgb(frame_rgb: np.ndarray, quality: int = JPEG_QUALITY) -> bytes:
+    import cv2
+
     image = np.asarray(frame_rgb)
     if image.dtype != np.uint8:
         image = np.clip(image, 0, 255).astype(np.uint8)
+    ok, buf = cv2.imencode(
+        ".jpg", cv2.cvtColor(image, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, int(quality)]
+    )
+    if not ok:
+        raise RuntimeError("failed to encode an RL frame as JPEG")
+    return buf.tobytes()
+
+
+def observation_zmq(frame_rgb: np.ndarray, state: np.ndarray, prompt: str) -> dict:
     return {
         "observation/state": np.asarray(state, dtype=np.float32).reshape(-1),
-        "observation/image": image,
+        "observation/image_jpeg": encode_jpeg_rgb(frame_rgb),
         "prompt": str(prompt),
     }
 
@@ -153,12 +167,9 @@ class RLTRollout:
                 if item is None:
                     return
                 chunk, stitch, head, left, right, state = item
-                image = np.asarray(stitch(head, left, right))
-                if image.dtype != np.uint8:
-                    image = np.clip(image, 0, 255).astype(np.uint8)
                 chunk["step_observations"].append(
                     {
-                        "observation/image": np.ascontiguousarray(image),
+                        "observation/image_jpeg": encode_jpeg_rgb(stitch(head, left, right)),
                         "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
                         "prompt": "",
                     }
@@ -187,12 +198,9 @@ class RLTRollout:
             ))
             return
         if frame_rgb is not None and state is not None:
-            image = np.asarray(frame_rgb)
-            if image.dtype != np.uint8:
-                image = np.clip(image, 0, 255).astype(np.uint8)
             chunk["step_observations"].append(
                 {
-                    "observation/image": np.ascontiguousarray(image),
+                    "observation/image_jpeg": encode_jpeg_rgb(frame_rgb),
                     "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
                     "prompt": "",
                 }

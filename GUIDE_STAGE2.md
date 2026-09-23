@@ -9,7 +9,7 @@
 - 裁剪和残差幅度用倒豆子 checkpoint 里的值（clip 约 `[-2.164, 6.031]`，`edit_scale=0.2`），不改成 Franka 的末端位姿尺度。
 - Motus 每次给出一条参考动作。EXPO 的 4 个 base 槽位都是这一条；另外 4 个是 actor 残差，4 个是 BC actor。
 
-不要占用 `15555`。那是另一台 GPU 部署策略的本地口。在线训练走机器人本机 `127.0.0.1:16555`。
+不要占用 `15555`。那是另一台 GPU 部署策略的本地口。在线训练走机器人本机 `127.0.0.1:16556`。
 
 ## 1. 训练机上启动服务
 
@@ -28,14 +28,17 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python train/serve_rlt_online.py \
 
 前 20 条 chunk（滑窗不算）返回 Motus 参考动作，样本入库，不做梯度。满 20 条之后才走 EXPO actor。成功或失败按下之后，客户端发 `episode_end`，服务才按「本回合 actor 块数 × 5」做更新。
 
-## 2. 从训练机打反向隧道
+## 2. 机器人上开正向隧道
+
+机器人经公网跳板 `123.56.183.38` 直接 ssh 到训练机（`~/.ssh/config` 里的 `motus-gpu`，密钥 `~/.ssh/id_ed25519_gpu`）。在跳板上这把钥匙只能转发到 `127.0.0.1:10099`，也就是训练机的 sshd。放在 tmux `rl-tunnel` 里，断了自动重连：
 
 ```bash
-ssh -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-  -R 127.0.0.1:16555:127.0.0.1:5555 unitree
+tmux new-session -d -s rl-tunnel 'while true; do ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -L 127.0.0.1:16556:127.0.0.1:5555 motus-gpu; sleep 3; done'
 ```
 
-机器人上 `ss -ltn | grep 16555` 应看到 `127.0.0.1:16555`。不要让这条隧道去占 `15555`。
+不要再用训练机经 tailscale 打的 `-R 16555` 反向隧道。那条走 userspace tailscale，实测一帧 act 要 50s，这条是 3s 以内。
+
+图像按 JPEG q90 发送（一帧约 20 KB，原始是 369 KB）。机器人上行只有约 1 Mbit/s，64 步的 transition 从约 24 MB 降到约 1.3 MB。
 
 ## 3. 机器人上开客户端
 
@@ -47,6 +50,7 @@ git checkout feat/rlt-stage2-online
 git pull --ff-only
 
 SKIP_TUNNEL=1 \
+RL_LOCAL_PORT=16556 \
 RL_ONLINE=1 \
 UNITREE_DDSINTERFACE=eth0 \
 IMAGE_HOST=192.168.123.164 \
@@ -54,7 +58,7 @@ INSTRUCTION="把方口杯里的红豆，倒进灰色的粗口杯里，倒半杯"
 ./scripts/run_deploy.sh
 ```
 
-`SKIP_TUNNEL=1` 会连 `127.0.0.1:16555`，并强制 `--rl-online`、关闭预取。图像服务和 `teleimager-server` 需要已经在 `192.168.123.164` 上。准备姿势到位后再按键。
+`SKIP_TUNNEL=1 RL_LOCAL_PORT=16556` 会连 `127.0.0.1:16556`，并强制 `--rl-online`、关闭预取。图像服务和 `teleimager-server` 需要已经在 `192.168.123.164` 上。准备姿势到位后再按键。
 
 ## 4. 按键
 

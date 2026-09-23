@@ -3,6 +3,7 @@ import pickle
 import threading
 import unittest
 
+import cv2
 import numpy as np
 import zmq
 
@@ -18,6 +19,10 @@ from teleop.utils.rlt_online import (
     rewind_plan,
     transition_fields,
 )
+
+
+def _decode(jpeg: bytes) -> np.ndarray:
+    return cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
 
 
 def _serve(sock, seen, stop):
@@ -117,7 +122,9 @@ class RLTOnlineTests(unittest.TestCase):
         )
         chunk = rollout.take_open()
         self.assertEqual(len(seen), 1)
-        self.assertEqual(chunk["step_observations"][0]["observation/image"].shape, (4, 4, 3))
+        self.assertEqual(
+            _decode(chunk["step_observations"][0]["observation/image_jpeg"]).shape, (4, 4, 3)
+        )
         self.assertEqual(chunk["step_observations"][0]["observation/state"].shape, (16,))
 
     def test_takeover_commands_match_policy_layout(self):
@@ -211,7 +218,8 @@ class RLTOnlineTests(unittest.TestCase):
         obs = seen[0]["observation"]
         self.assertEqual(obs["prompt"], "倒豆子")
         self.assertEqual(np.asarray(obs["observation/state"]).shape, (16,))
-        self.assertEqual(obs["observation/image"].dtype, np.uint8)
+        self.assertNotIn("observation/image", obs)
+        self.assertEqual(_decode(obs["observation/image_jpeg"]).shape, (8, 8, 3))
         self.assertEqual(seen[0]["identity"]["episode_id"], 3)
         self.assertEqual(seen[1]["action_chunk_space"], "robot")
         self.assertTrue(seen[1]["done"])
