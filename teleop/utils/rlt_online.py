@@ -303,6 +303,67 @@ def qpos_command(arm_q, left_grip: float, right_grip: float) -> np.ndarray:
     return raw[_REORDER_FROM_RAW]
 
 
+def _rotation_angle(a: np.ndarray, b: np.ndarray) -> float:
+    relative = np.asarray(a, dtype=float)[:3, :3].T @ np.asarray(b, dtype=float)[:3, :3]
+    return float(np.arccos(np.clip((np.trace(relative) - 1.0) * 0.5, -1.0, 1.0)))
+
+
+class TeleopMotionGate:
+    """remote-franka ``GelloTakeover.should_count`` for both G1-D arms.
+
+    A teleop tick becomes a takeover chunk step only if either arm moved past
+    the deadband since the last counted step. Holding still is still executed,
+    but it is never stored as an intervention action.
+    """
+
+    POS_DEADBAND_M = 0.0015
+    ROT_DEADBAND_RAD = 0.01
+    JOINT_DEADBAND_RAD = 0.02
+    # Franka compares a 0/1 gripper against 0.25. G1-D grippers span about 5.5.
+    GRIP_DEADBAND = 0.25 * 5.5
+
+    def __init__(self):
+        self._last: Optional[tuple] = None
+
+    @property
+    def seeded(self) -> bool:
+        return self._last is not None
+
+    def clear(self) -> None:
+        self._last = None
+
+    def reset(self, command, left_pose, right_pose) -> None:
+        """Use the pose held at handoff as the baseline; it is not a step."""
+        self._last = (
+            np.asarray(command, dtype=np.float32).reshape(-1).copy(),
+            np.asarray(left_pose, dtype=float).copy(),
+            np.asarray(right_pose, dtype=float).copy(),
+        )
+
+    def should_count(self, command, left_pose, right_pose, *, commit: bool = True) -> bool:
+        cmd = np.asarray(command, dtype=np.float32).reshape(-1)
+        if self._last is None:
+            if commit:
+                self.reset(cmd, left_pose, right_pose)
+            return False
+        last_cmd, last_left, last_right = self._last
+        moved = False
+        for joints, grip, pose, last_pose in (
+            (slice(0, 7), 7, left_pose, last_left),
+            (slice(8, 15), 15, right_pose, last_right),
+        ):
+            pose = np.asarray(pose, dtype=float)
+            if (np.linalg.norm(pose[:3, 3] - last_pose[:3, 3]) >= self.POS_DEADBAND_M
+                    or _rotation_angle(last_pose, pose) >= self.ROT_DEADBAND_RAD
+                    or np.linalg.norm(cmd[joints] - last_cmd[joints]) >= self.JOINT_DEADBAND_RAD
+                    or abs(float(cmd[grip]) - float(last_cmd[grip])) > self.GRIP_DEADBAND):
+                moved = True
+                break
+        if moved and commit:
+            self.reset(cmd, left_pose, right_pose)
+        return moved
+
+
 class TakeoverChunk:
     """Human joint commands recorded against one pending ``act``.
 

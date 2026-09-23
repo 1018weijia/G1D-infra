@@ -43,6 +43,7 @@ from teleop.utils.rlt_online import (
     RLTRollout,
     SUCCESS_REWARD,
     TakeoverChunk,
+    TeleopMotionGate,
     outcome_ends_without_chunk,
     qpos_command,
     rewind_frame_count,
@@ -674,6 +675,7 @@ if __name__ == "__main__":
         policy_inference_enabled = False
         rollout = RLTRollout() if args.rl_online else None
         takeover = TakeoverChunk()
+        teleop_gate = TeleopMotionGate()
         # arming: an act is in flight whose actions must not move the arm.
         # after: what to do when that act returns ("discard", "resume", or None).
         # rows: human commands captured while that act is still in flight.
@@ -1741,11 +1743,10 @@ if __name__ == "__main__":
                         A_DEBOUNCE_UNTIL, time.monotonic() + A_TELEOP_READY_DEBOUNCE_S
                     )
                     logger_mp.info(
-                        "Teleoperation handoff active. Human joint commands are recorded for RL. "
-                        "Press gamepad A again to return control to policy."
+                        "Teleoperation handoff active. Only moving human commands are recorded for RL; "
+                        "holding still is not. Press gamepad A again to return control to policy."
                     )
-                    if args.rl_online:
-                        _arm_takeover()
+                    teleop_gate.clear()
 
             if RUN_PHASE == POLICY_LIVE:
                 rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
@@ -1757,14 +1758,28 @@ if __name__ == "__main__":
                     rollback_buffer.append(sol_q[:14], sol_tauff[:14], tele_left_grip, tele_right_grip)
                     if args.rl_online:
                         command = qpos_command(sol_q[:14], tele_left_grip, tele_right_grip)
-                        if takeover_gate["arming"]:
-                            if len(takeover_gate["rows"]) < takeover_gate["chunk_len"]:
+                        left_pose, right_pose = arm_ik.solve_fk_matrix(
+                            np.asarray(sol_q[:14], dtype=float)
+                        )
+                        if not teleop_gate.seeded:
+                            teleop_gate.reset(command, left_pose, right_pose)
+                        elif teleop_gate.should_count(command, left_pose, right_pose, commit=False):
+                            # The chunk observation is taken at the first real
+                            # move, not while the operator is still settling.
+                            recorded = True
+                            if takeover_gate["arming"]:
+                                if len(takeover_gate["rows"]) < takeover_gate["chunk_len"]:
+                                    takeover_gate["rows"].append(command)
+                            elif takeover.active:
+                                if (takeover.push(command)
+                                        and not rl_deferred and not inference_busy()):
+                                    _commit_takeover("hold")
+                            elif _arm_takeover():
                                 takeover_gate["rows"].append(command)
-                        elif (takeover.active and takeover.push(command)
-                                and not rl_deferred and not inference_busy()):
-                            _commit_takeover("hold")
-                        elif not takeover.active:
-                            _arm_takeover()
+                            else:
+                                recorded = False
+                            if recorded:
+                                teleop_gate.reset(command, left_pose, right_pose)
 
             last_arm_q = np.asarray(sol_q[:14], dtype=float).copy()
             last_tau = np.asarray(sol_tauff[:14], dtype=float).copy()

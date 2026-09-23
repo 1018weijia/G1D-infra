@@ -12,6 +12,7 @@ from teleop.utils.rlt_online import (
     REQUEST_KEY,
     RLTRollout,
     TakeoverChunk,
+    TeleopMotionGate,
     chunk_rewards,
     outcome_ends_without_chunk,
     qpos_command,
@@ -53,6 +54,27 @@ def _serve(sock, seen, stop):
 
 
 class RLTOnlineTests(unittest.TestCase):
+    def test_holding_still_after_handoff_is_not_a_takeover_step(self):
+        gate = TeleopMotionGate()
+        pose = np.eye(4)
+        hold = np.zeros(16, dtype=np.float32)
+        hold[7] = hold[15] = 5.3
+        self.assertFalse(gate.should_count(hold, pose, pose))
+        self.assertTrue(gate.seeded)
+        jitter = hold.copy()
+        jitter[0] += 0.005
+        nudged = pose.copy()
+        nudged[0, 3] += 0.0005
+        self.assertFalse(gate.should_count(jitter, nudged, pose))
+        moved = pose.copy()
+        moved[1, 3] += 0.002
+        self.assertTrue(gate.should_count(hold, pose, moved, commit=False))
+        self.assertTrue(gate.should_count(hold, pose, moved))
+        self.assertFalse(gate.should_count(hold, pose, moved))
+        squeeze = hold.copy()
+        squeeze[15] = 1.0
+        self.assertTrue(gate.should_count(squeeze, pose, moved))
+
     def test_outcome_while_waiting_does_not_attach_to_the_next_chunk(self):
         self.assertTrue(outcome_ends_without_chunk("success", False, 0))
         self.assertTrue(outcome_ends_without_chunk("failure", False, 0))
