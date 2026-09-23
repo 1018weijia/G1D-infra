@@ -58,6 +58,11 @@ def transition_fields(
     }
 
 
+def outcome_ends_without_chunk(outcome, chunk_open: bool, queued_steps: int) -> bool:
+    """Y/N with nothing executing ends now, instead of riding the next chunk."""
+    return outcome in ("success", "failure") and not chunk_open and int(queued_steps) <= 0
+
+
 def chunk_rewards(length: int, outcome: Optional[str]) -> np.ndarray:
     """Per-step rewards. Only a success writes +1 on the last step."""
     rewards = np.zeros(int(length), dtype=np.float32)

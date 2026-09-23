@@ -12,6 +12,7 @@ from teleop.utils.rlt_online import (
     RLTRollout,
     TakeoverChunk,
     chunk_rewards,
+    outcome_ends_without_chunk,
     qpos_command,
     rewind_frame_count,
     rewind_plan,
@@ -47,6 +48,13 @@ def _serve(sock, seen, stop):
 
 
 class RLTOnlineTests(unittest.TestCase):
+    def test_outcome_while_waiting_does_not_attach_to_the_next_chunk(self):
+        self.assertTrue(outcome_ends_without_chunk("success", False, 0))
+        self.assertTrue(outcome_ends_without_chunk("failure", False, 0))
+        self.assertFalse(outcome_ends_without_chunk("success", True, 0))
+        self.assertFalse(outcome_ends_without_chunk("success", False, 3))
+        self.assertFalse(outcome_ends_without_chunk(None, False, 0))
+
     def test_rewards_and_bootstrap(self):
         success = chunk_rewards(4, "success")
         self.assertEqual(success.tolist(), [0.0, 0.0, 0.0, 1.0])

@@ -43,6 +43,7 @@ from teleop.utils.rlt_online import (
     RLTRollout,
     SUCCESS_REWARD,
     TakeoverChunk,
+    outcome_ends_without_chunk,
     qpos_command,
     rewind_frame_count,
     rewind_plan,
@@ -132,7 +133,8 @@ def on_press(key):
         if key == "y":
             RL_PENDING_STEP_REWARD += SUCCESS_REWARD
         logger_mp.info(
-            "[on_press] %s: this chunk will end the episode as %s.",
+            "[on_press] %s: episode ends as %s. A running chunk finishes first; "
+            "otherwise the arm returns to the ready pose now.",
             key.upper(), RL_OUTCOME_REQUEST,
         )
         return
@@ -336,6 +338,16 @@ def _run_rlt_job(adapter, remote, job, instruction):
     if discard_id:
         remote.discard(discard_id)
         logger_mp.info("RL discard sent for %s", discard_id)
+    if job.get("episode_end_only"):
+        remote.episode_end(
+            success=bool(job.get("success")),
+            episode_id=int(job.get("episode_id", 0)),
+        )
+        logger_mp.info(
+            "RL episode %s ended without another chunk (success=%s).",
+            job.get("episode_id"), bool(job.get("success")),
+        )
+        return {"kind": "closed"}
     spec = job.get("transition")
     if spec is not None:
         step_observations = spec.get("step_observations") or []
@@ -666,12 +678,13 @@ if __name__ == "__main__":
         takeover_gate = {"arming": False, "after": None, "rows": [], "chunk_len": 64, "issued_chunk_id": 0}
         rl_report_due = False
         rl_inflight = None
+        idle_discard_id = None
+        idle_end_cancelled = False
         last_arm_q = hold_q.copy()
         last_tau = hold_tau.copy()
         last_left_grip = left_hold_grip
         last_right_grip = right_hold_grip
         handoff = new_handoff_runtime()
-        resume_wait_log_time = 0.0
         alignment_log_time = 0.0
         inference_lock = threading.Lock()
         inference_state = {
@@ -865,12 +878,39 @@ if __name__ == "__main__":
             )
             return True
 
+        def _hold_policy_pose(from_label):
+            """Stop following the hands now. The next act is requested when the worker is free."""
+            global RUN_PHASE, action_queue, policy_inference_enabled, recording
+            global last_arm_q, last_tau, last_left_grip, last_right_grip
+            resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
+            resume_left, resume_right = _read_grippers(arm_ctrl)
+            arm_ik.reset_solution_state(resume_q)
+            arm_ctrl.set_policy_gripper_q(resume_left, resume_right)
+            action_queue = []
+            policy_inference_enabled = True
+            last_arm_q = resume_q.copy()
+            last_tau = arm_ik.solve_tau(resume_q).copy()
+            last_left_grip, last_right_grip = resume_left, resume_right
+            clear_handoff_runtime()
+            RUN_PHASE = POLICY_LIVE
+            recording = _start_record_episode(args, recorder, recording)
+            logger_mp.info(
+                "Policy holding the %s. The next chunk starts when the server is free.",
+                from_label,
+            )
+
         def _enter_policy_from_takeover():
             global RUN_PHASE, action_queue, policy_inference_enabled, recording
             global last_arm_q, last_tau, last_left_grip, last_right_grip
-            if takeover_gate["arming"] or inference_busy():
+            if takeover_gate["arming"]:
                 takeover_gate["after"] = "resume"
                 return False
+            if inference_busy():
+                # The in-flight act was sampled before this pose. Do not play it.
+                invalidate_inference()
+                takeover_gate["after"] = "resume" if takeover.active else None
+                _hold_policy_pose("teleop pose")
+                return True
             if takeover.active:
                 if not _commit_takeover("execute"):
                     return False
@@ -949,15 +989,13 @@ if __name__ == "__main__":
             global RUN_PHASE
             global action_queue, policy_inference_enabled
             global last_arm_q, last_tau, last_left_grip, last_right_grip
-            global resume_wait_log_time, recording
+            global recording
             if inference_busy():
-                now = time.monotonic()
-                if now - resume_wait_log_time >= 1.0:
-                    logger_mp.info(
-                        "Policy resume queued; waiting for previous inference request to finish."
-                    )
-                    resume_wait_log_time = now
-                return False
+                # Hand the arm back immediately. The request still on the wire
+                # was sampled from an older pose, so its actions are discarded.
+                invalidate_inference()
+                _hold_policy_pose(from_label)
+                return True
             resume_q, resume_tau, resume_left_grip, resume_right_grip = (
                 _start_policy_from_current_pose(
                     adapter, img_client, arm_ctrl, arm_ik,
@@ -1098,6 +1136,8 @@ if __name__ == "__main__":
                 if args.rl_online:
                     RL_OUTCOME_REQUEST = None
                     rl_report_due = False
+                    idle_discard_id = None
+                    idle_end_cancelled = False
                     episode_id = rollout.begin_episode()
                     logger_mp.info(
                         "RL episode %d started from the ready pose. Y=success, N=failure.",
@@ -1287,19 +1327,28 @@ if __name__ == "__main__":
                     if kind == "act" and ready_queue.get("hold_actions"):
                         _accept_hold(ready_queue)
                     elif kind == "act":
-                        model_actions = ready_queue.get("model_actions")
-                        if model_actions is not None:
-                            takeover_gate["chunk_len"] = int(np.asarray(model_actions).shape[0])
-                        action_queue = list(ready_queue["queue"])
-                        rollout.accept_chunk(
-                            ready_queue["transition_id"],
-                            ready_queue["model_actions"],
-                            len(action_queue),
-                        )
-                        logger_mp.info(
-                            "RL executing chunk id=%s steps=%d",
-                            ready_queue["transition_id"], len(action_queue),
-                        )
+                        if outcome_ends_without_chunk(
+                            RL_OUTCOME_REQUEST, rollout.open is not None, len(action_queue),
+                        ):
+                            idle_discard_id = ready_queue.get("transition_id")
+                            logger_mp.info(
+                                "RL act %s will not run; the episode is already ending.",
+                                idle_discard_id,
+                            )
+                        else:
+                            model_actions = ready_queue.get("model_actions")
+                            if model_actions is not None:
+                                takeover_gate["chunk_len"] = int(np.asarray(model_actions).shape[0])
+                            action_queue = list(ready_queue["queue"])
+                            rollout.accept_chunk(
+                                ready_queue["transition_id"],
+                                ready_queue["model_actions"],
+                                len(action_queue),
+                            )
+                            logger_mp.info(
+                                "RL executing chunk id=%s steps=%d",
+                                ready_queue["transition_id"], len(action_queue),
+                            )
                     elif kind == "closed":
                         RL_EPISODE_CLOSING = False
                         if RUN_PHASE == POLICY_LIVE:
@@ -1434,6 +1483,66 @@ if __name__ == "__main__":
                             logger_mp.error(
                                 "RL transition observation failed; retrying: %s",
                                 request_error,
+                            )
+                    elif outcome_ends_without_chunk(
+                            RL_OUTCOME_REQUEST, rollout.open is not None, len(action_queue),
+                    ):
+                        if worker_busy:
+                            if not idle_end_cancelled:
+                                invalidate_inference()
+                                idle_end_cancelled = True
+                                logger_mp.info(
+                                    "No chunk is running. Cancelling the request still in flight."
+                                )
+                        else:
+                            outcome = RL_OUTCOME_REQUEST
+                            job = {
+                                "rlt": True,
+                                "episode_end_only": True,
+                                "success": outcome == "success",
+                                "episode_id": rollout.episode_id,
+                            }
+                            if idle_discard_id:
+                                job["discard_id"] = idle_discard_id
+                            if start_inference(job):
+                                RL_OUTCOME_REQUEST = None
+                                RL_PENDING_STEP_REWARD = 0.0
+                                idle_discard_id = None
+                                idle_end_cancelled = False
+                                policy_inference_enabled = False
+                                RL_EPISODE_CLOSING = False
+                                RL_TAKEOVER_REQUEST = False
+                                START_POLICY = False
+                                action_queue = []
+                                logger_mp.info(
+                                    "No chunk is running. Ending as %s and returning to the ready pose.",
+                                    outcome,
+                                )
+                                ready_result = move_to_ready_pose(
+                                    arm_ctrl,
+                                    arm_ik,
+                                    ready_pose_q,
+                                    args.ready_pose_seconds,
+                                    args.frequency,
+                                    grippers=(last_left_grip, last_right_grip),
+                                    stop_requested=lambda: STOP,
+                                )
+                                last_arm_q = ready_result.arm_q.copy()
+                                last_tau = ready_result.tau.copy()
+                                RUN_PHASE = POLICY_IDLE
+                                logger_mp.info(
+                                    "Ready pose reached. Press S to start the next episode."
+                                )
+                                continue
+                    elif (takeover_gate["after"] == "resume" and takeover.active
+                            and not worker_busy and rollout.open is None and not action_queue):
+                        try:
+                            if _commit_takeover("execute"):
+                                takeover_gate["after"] = None
+                        except Exception as resume_error:
+                            logger_mp.error(
+                                "Takeover report failed while handing control back: %s",
+                                resume_error,
                             )
                     elif (policy_inference_enabled and rollout.open is None
                             and not rl_report_due and not action_queue and not worker_busy):
