@@ -1302,20 +1302,7 @@ if __name__ == "__main__":
                         )
                     elif kind == "closed":
                         RL_EPISODE_CLOSING = False
-                        if START_POLICY:
-                            RUN_PHASE = POLICY_IDLE
-                            policy_inference_enabled = False
-                            logger_mp.info(
-                                "RL episode %d ended. Starting the next one.",
-                                rollout.episode_id,
-                            )
-                        elif RL_TAKEOVER_REQUEST:
-                            policy_inference_enabled = False
-                            logger_mp.info(
-                                "RL episode %d ended. Align and press A to take over.",
-                                rollout.episode_id,
-                            )
-                        else:
+                        if RUN_PHASE == POLICY_LIVE:
                             policy_inference_enabled = False
                             RUN_PHASE = POLICY_IDLE
                             logger_mp.info(
@@ -1408,10 +1395,29 @@ if __name__ == "__main__":
                                     chunk = None
                                     if fields["done"]:
                                         policy_inference_enabled = False
-                                        RL_EPISODE_CLOSING = True
+                                        RL_EPISODE_CLOSING = False
+                                        RL_TAKEOVER_REQUEST = False
+                                        START_POLICY = False
+                                        action_queue = []
                                         logger_mp.info(
-                                            "Episode outcome recorded. S starts another episode, A aligns for takeover."
+                                            "Outcome sent. Returning to the ready pose."
                                         )
+                                        ready_result = move_to_ready_pose(
+                                            arm_ctrl,
+                                            arm_ik,
+                                            ready_pose_q,
+                                            args.ready_pose_seconds,
+                                            args.frequency,
+                                            grippers=(last_left_grip, last_right_grip),
+                                            stop_requested=lambda: STOP,
+                                        )
+                                        last_arm_q = ready_result.arm_q.copy()
+                                        last_tau = ready_result.tau.copy()
+                                        RUN_PHASE = POLICY_IDLE
+                                        logger_mp.info(
+                                            "Ready pose reached. Press S to start the next episode."
+                                        )
+                                        continue
                                 else:
                                     rollout.open = chunk
                                     chunk = None
