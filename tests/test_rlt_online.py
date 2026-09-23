@@ -36,7 +36,7 @@ def _serve(sock, seen, stop):
                 "actions": actions,
                 "transition_id": "t-1",
             }))
-        elif kind in ("transition", "discard"):
+        elif kind in ("transition", "discard", "episode_end"):
             sock.send(pickle.dumps({"status": "ok", REQUEST_KEY: kind}))
         else:
             state = np.asarray(req["state"], dtype=np.float32)
@@ -190,6 +190,8 @@ class RLTOnlineTests(unittest.TestCase):
             )
             self.assertEqual(report["status"], "ok")
             client.discard("t-unused")
+            client.episode_end(success=True, episode_id=3)
+            client.episode_end(success=True, episode_id=4, terminal_reward=1.0)
             actions, _predict_ms = client.predict(frame, state, "倒豆子")
             self.assertEqual(actions.shape, (4, 16))
         finally:
@@ -200,7 +202,12 @@ class RLTOnlineTests(unittest.TestCase):
             ctx.term()
 
         kinds = [item.get(REQUEST_KEY) for item in seen]
-        self.assertEqual(kinds, ["act", "transition", "discard", None])
+        self.assertEqual(
+            kinds, ["act", "transition", "discard", "episode_end", "episode_end", None]
+        )
+        self.assertNotIn("close_last", seen[3])
+        self.assertTrue(seen[4]["close_last"])
+        self.assertAlmostEqual(seen[4]["terminal_reward"], 1.0)
         obs = seen[0]["observation"]
         self.assertEqual(obs["prompt"], "倒豆子")
         self.assertEqual(np.asarray(obs["observation/state"]).shape, (16,))

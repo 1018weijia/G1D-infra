@@ -483,13 +483,22 @@ class PolicyRemoteClient:
             payload["chunks_rewound"] = int(plan["chunks"])
         return self._exchange(payload)
 
-    def episode_end(self, *, success: bool, episode_id: int) -> dict:
-        """Ask the server to add sliding windows and run this episode's updates."""
+    def episode_end(
+        self, *, success: bool, episode_id: int, terminal_reward: Optional[float] = None,
+    ) -> dict:
+        """Ask the server to add sliding windows and run this episode's updates.
+
+        ``terminal_reward`` closes the last stored chunk as the terminal row. It is
+        for Y/N pressed between chunks, when no done transition will be sent.
+        """
         payload = {
             REQUEST_KEY: REQUEST_EPISODE_END,
             "type": "rlt",
             "stats": {"success": bool(success), "episode_id": int(episode_id)},
         }
+        if terminal_reward is not None:
+            payload["close_last"] = True
+            payload["terminal_reward"] = float(terminal_reward)
         return self._exchange(payload)
 
     def discard(self, transition_id: str) -> dict:

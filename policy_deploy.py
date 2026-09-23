@@ -342,10 +342,12 @@ def _run_rlt_job(adapter, remote, job, instruction):
         remote.episode_end(
             success=bool(job.get("success")),
             episode_id=int(job.get("episode_id", 0)),
+            terminal_reward=float(job.get("terminal_reward", 0.0)),
         )
         logger_mp.info(
-            "RL episode %s ended without another chunk (success=%s).",
+            "RL episode %s ended on its last stored chunk (success=%s reward=%.1f).",
             job.get("episode_id"), bool(job.get("success")),
+            float(job.get("terminal_reward", 0.0)),
         )
         return {"kind": "closed"}
     spec = job.get("transition")
@@ -390,11 +392,11 @@ def _run_rlt_job(adapter, remote, job, instruction):
         return {"kind": "discard"}
     act = job.get("act")
     if act is None:
-        # A finished episode has no next act. A takeover report doesn't either,
-        # and must not be treated as the episode ending.
-        if spec is not None and not spec.get("done"):
-            return {"kind": "reported"}
-        return {"kind": "closed"}
+        # Only a done transition ends the episode. Takeover and rewind reports
+        # have no next act either.
+        if spec is not None and spec.get("done"):
+            return {"kind": "closed"}
+        return {"kind": "reported"}
     frame, state, arm_q, episode_id, chunk_id = act
     reply = remote.act(
         frame, state, instruction, episode_id=episode_id, chunk_id=chunk_id,
@@ -678,6 +680,7 @@ if __name__ == "__main__":
         takeover_gate = {"arming": False, "after": None, "rows": [], "chunk_len": 64, "issued_chunk_id": 0}
         rl_report_due = False
         rl_inflight = None
+        rl_deferred = []
         idle_discard_id = None
         idle_end_cancelled = False
         last_arm_q = hold_q.copy()
@@ -802,9 +805,14 @@ if __name__ == "__main__":
                 },
             }
 
+        def _send_or_defer(job):
+            """Reports must reach the server even if the worker is busy right now."""
+            if not start_inference(job):
+                rl_deferred.append(job)
+
         def _arm_takeover():
             if (not args.rl_online or takeover.active or takeover_gate["arming"]
-                    or inference_busy()):
+                    or rl_deferred or inference_busy()):
                 return False
             try:
                 request = _rlt_act_request(
@@ -900,58 +908,28 @@ if __name__ == "__main__":
             )
 
         def _enter_policy_from_takeover():
-            global RUN_PHASE, action_queue, policy_inference_enabled, recording
-            global last_arm_q, last_tau, last_left_grip, last_right_grip
-            if takeover_gate["arming"]:
+            """Leave teleop at once. Never wait on the server here.
+
+            The human chunk is reported, and the next act requested, by the
+            POLICY_LIVE loop once the worker is free.
+            """
+            if takeover_gate["arming"] or takeover.active:
                 takeover_gate["after"] = "resume"
-                return False
-            if inference_busy():
-                # The in-flight act was sampled before this pose. Do not play it.
-                invalidate_inference()
-                takeover_gate["after"] = "resume" if takeover.active else None
-                _hold_policy_pose("teleop pose")
-                return True
-            if takeover.active:
-                if not _commit_takeover("execute"):
-                    return False
             else:
-                try:
-                    request = _rlt_act_request(
-                        _prepare_policy_request(adapter, img_client, arm_ctrl)
-                    )
-                except Exception as error:
-                    logger_mp.error("Policy resume observation failed: %s", error)
-                    return False
-                if not start_inference(request):
-                    return False
-            resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
-            resume_left, resume_right = _read_grippers(arm_ctrl)
-            arm_ik.reset_solution_state(resume_q)
-            arm_ctrl.set_policy_gripper_q(resume_left, resume_right)
-            action_queue = []
-            policy_inference_enabled = True
-            last_arm_q = resume_q.copy()
-            last_tau = arm_ik.solve_tau(resume_q).copy()
-            last_left_grip, last_right_grip = resume_left, resume_right
-            clear_handoff_runtime()
-            RUN_PHASE = POLICY_LIVE
-            recording = _start_record_episode(args, recorder, recording)
-            logger_mp.info("Policy resumed from teleop; waiting for chunk.")
+                takeover_gate["after"] = None
+            _hold_policy_pose("teleop pose")
             return True
 
+        def _takeover_pending():
+            return takeover_gate["arming"] or takeover_gate["after"] == "resume"
+
         def _accept_hold(result):
-            global RESUME_POLICY
             takeover_gate["arming"] = False
             follow = takeover_gate["after"]
             takeover_gate["after"] = None
-            if follow == "discard" or RUN_PHASE != TELEOP_LIVE:
-                discard = {"rlt": True, "discard_id": result["transition_id"]}
+            if follow == "discard" or (RUN_PHASE != TELEOP_LIVE and follow != "resume"):
                 takeover_gate["rows"] = []
-                if not start_inference(discard):
-                    logger_mp.error(
-                        "Could not discard unused takeover act %s",
-                        result["transition_id"],
-                    )
+                _send_or_defer({"rlt": True, "discard_id": result["transition_id"]})
                 return
             chunk_len = int(np.asarray(result["model_actions"]).shape[0])
             takeover_gate["chunk_len"] = chunk_len
@@ -970,8 +948,7 @@ if __name__ == "__main__":
                 result["transition_id"], takeover.steps,
             )
             if follow == "resume":
-                if _enter_policy_from_takeover():
-                    RESUME_POLICY = False
+                takeover_gate["after"] = "resume"
                 return
             if takeover.steps >= takeover.chunk_len:
                 _commit_takeover("hold")
@@ -1086,10 +1063,17 @@ if __name__ == "__main__":
                     RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
                 )
 
+            if args.rl_online:
+                held = _pop_hold_result()
+                if held is not None:
+                    _accept_hold(held)
+
             if args.rl_online and RUN_PHASE != POLICY_LIVE:
                 with inference_lock:
                     outside_result = inference_state["result"]
-                    if outside_result is not None:
+                    if isinstance(outside_result, dict) and outside_result.get("hold_actions"):
+                        outside_result = None
+                    elif outside_result is not None:
                         inference_state["result"] = None
                     outside_error = inference_state["error"]
                     inference_state["error"] = None
@@ -1098,8 +1082,30 @@ if __name__ == "__main__":
                 if isinstance(outside_result, dict) and outside_result.get("kind") == "closed":
                     RL_EPISODE_CLOSING = False
                     logger_mp.info("RL episode %d report finished.", rollout.episode_id)
+                elif isinstance(outside_result, dict) and outside_result.get("kind") == "act":
+                    rl_deferred.append(
+                        {"rlt": True, "discard_id": outside_result["transition_id"]}
+                    )
                 elif outside_error is not None:
                     logger_mp.error("Policy inference failed: %s", outside_error)
+
+            if args.rl_online and rl_deferred and start_inference(rl_deferred[0]):
+                rl_deferred.pop(0)
+
+            if args.rl_online and takeover_gate["arming"]:
+                with inference_lock:
+                    hold_lost = (
+                        inference_state["thread"] is None
+                        and inference_state["result"] is None
+                    )
+                if hold_lost:
+                    takeover_gate["arming"] = False
+                    takeover_gate["rows"] = []
+                    if takeover_gate["after"] == "resume":
+                        takeover_gate["after"] = None
+                    logger_mp.warning(
+                        "Takeover act was dropped by the server or cancelled; not recording this takeover chunk."
+                    )
 
             if (args.rl_online and RL_TAKEOVER_REQUEST and not action_queue
                     and RUN_PHASE == POLICY_LIVE):
@@ -1135,9 +1141,14 @@ if __name__ == "__main__":
                 recording = _start_record_episode(args, recorder, recording)
                 if args.rl_online:
                     RL_OUTCOME_REQUEST = None
+                    RL_PENDING_STEP_REWARD = 0.0
                     rl_report_due = False
                     idle_discard_id = None
                     idle_end_cancelled = False
+                    takeover_gate["after"] = None
+                    takeover_gate["rows"] = []
+                    if takeover.active:
+                        takeover.close()
                     episode_id = rollout.begin_episode()
                     logger_mp.info(
                         "RL episode %d started from the ready pose. Y=success, N=failure.",
@@ -1148,13 +1159,7 @@ if __name__ == "__main__":
                         "Policy rollout started from the ready pose and is requesting the first chunk."
                     )
 
-            if args.rl_online:
-                held = _pop_hold_result()
-                if held is not None:
-                    _accept_hold(held)
-
-            if args.rl_online and RESUME_POLICY and RUN_PHASE == TELEOP_LIVE and (
-                    takeover_gate["arming"] or takeover.active):
+            if args.rl_online and RESUME_POLICY and RUN_PHASE == TELEOP_LIVE:
                 try:
                     if _enter_policy_from_takeover():
                         RESUME_POLICY = False
@@ -1179,24 +1184,26 @@ if __name__ == "__main__":
             if ROLLBACK_REQUEST and RUN_PHASE in ROLLBACK_FROM_PHASES:
                 ROLLBACK_REQUEST = False
                 rl_event = None
-                close_takeover = False
                 if args.rl_online and RUN_PHASE == POLICY_LIVE:
                     rl_report_due = False
                     rl_inflight = None
                     RL_OUTCOME_REQUEST = None
                     rl_event = rollout.interrupt()
-                elif args.rl_online and RUN_PHASE == TELEOP_LIVE:
-                    close_takeover = takeover.active
-                    if takeover_gate["arming"]:
-                        takeover_gate["arming"] = False
-                        takeover_gate["after"] = None
-                        takeover_gate["rows"] = []
+                if args.rl_online:
+                    takeover_gate["arming"] = False
+                    takeover_gate["after"] = None
+                    takeover_gate["rows"] = []
                 policy_inference_enabled = False
                 invalidate_inference()
                 action_queue.clear()
                 prefetched_queue.clear()
-                if close_takeover:
-                    _commit_takeover(None)
+                if args.rl_online and takeover.active:
+                    closed = takeover.close()
+                    if closed is not None:
+                        try:
+                            _send_or_defer(_takeover_job(closed[0], closed[1], None))
+                        except Exception as report_error:
+                            logger_mp.error("Takeover report before rollback failed: %s", report_error)
                 raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
                 if args.rl_online and RUN_PHASE == POLICY_LIVE:
                     kind, chunk = rl_event if rl_event is not None else (None, None)
@@ -1235,7 +1242,10 @@ if __name__ == "__main__":
                             if start_inference(job):
                                 rl_inflight = job
                             else:
-                                logger_mp.error("Could not report the rollback to the RL server.")
+                                rl_deferred.append(job)
+                                logger_mp.info(
+                                    "Rollback report queued; it is sent after the current RL request."
+                                )
                     except Exception as report_error:
                         logger_mp.error(
                             "Failed to report interrupted RL chunk: %s", report_error
@@ -1408,7 +1418,7 @@ if __name__ == "__main__":
                             chunk_just_finished = True
                 if args.rl_online:
                     if (rl_report_due and not chunk_just_finished
-                            and not worker_busy and not action_queue):
+                            and not worker_busy and not rl_deferred and not action_queue):
                         try:
                             outcome = None
                             chunk = None
@@ -1484,11 +1494,26 @@ if __name__ == "__main__":
                                 "RL transition observation failed; retrying: %s",
                                 request_error,
                             )
+                    elif (takeover_gate["after"] == "resume" and takeover.active
+                            and not worker_busy and not rl_deferred
+                            and rollout.open is None and not action_queue):
+                        # With Y/N already pressed, report the human chunk
+                        # without asking for another policy chunk.
+                        next_act = None if RL_OUTCOME_REQUEST else "execute"
+                        try:
+                            _commit_takeover(next_act)
+                        except Exception as resume_error:
+                            logger_mp.error(
+                                "Takeover report failed while handing control back: %s",
+                                resume_error,
+                            )
+                        if not takeover.active:
+                            takeover_gate["after"] = None
                     elif outcome_ends_without_chunk(
                             RL_OUTCOME_REQUEST, rollout.open is not None, len(action_queue),
                     ):
-                        if worker_busy:
-                            if not idle_end_cancelled:
+                        if worker_busy or rl_deferred:
+                            if worker_busy and not idle_end_cancelled:
                                 invalidate_inference()
                                 idle_end_cancelled = True
                                 logger_mp.info(
@@ -1501,6 +1526,7 @@ if __name__ == "__main__":
                                 "episode_end_only": True,
                                 "success": outcome == "success",
                                 "episode_id": rollout.episode_id,
+                                "terminal_reward": float(RL_PENDING_STEP_REWARD),
                             }
                             if idle_discard_id:
                                 job["discard_id"] = idle_discard_id
@@ -1534,18 +1560,9 @@ if __name__ == "__main__":
                                     "Ready pose reached. Press S to start the next episode."
                                 )
                                 continue
-                    elif (takeover_gate["after"] == "resume" and takeover.active
-                            and not worker_busy and rollout.open is None and not action_queue):
-                        try:
-                            if _commit_takeover("execute"):
-                                takeover_gate["after"] = None
-                        except Exception as resume_error:
-                            logger_mp.error(
-                                "Takeover report failed while handing control back: %s",
-                                resume_error,
-                            )
                     elif (policy_inference_enabled and rollout.open is None
-                            and not rl_report_due and not action_queue and not worker_busy):
+                            and not rl_report_due and not action_queue and not worker_busy
+                            and not rl_deferred and not _takeover_pending()):
                         try:
                             request = _rlt_act_request(
                                 _prepare_policy_request(adapter, img_client, arm_ctrl)
@@ -1743,7 +1760,8 @@ if __name__ == "__main__":
                         if takeover_gate["arming"]:
                             if len(takeover_gate["rows"]) < takeover_gate["chunk_len"]:
                                 takeover_gate["rows"].append(command)
-                        elif takeover.active and takeover.push(command):
+                        elif (takeover.active and takeover.push(command)
+                                and not rl_deferred and not inference_busy()):
                             _commit_takeover("hold")
                         elif not takeover.active:
                             _arm_takeover()
