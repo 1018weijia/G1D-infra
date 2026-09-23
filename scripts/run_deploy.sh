@@ -65,17 +65,25 @@ if [[ -z "$INSTRUCTION" ]]; then
   exit 1
 fi
 
-if [[ -z "$SSH_HOST" || -z "$SSH_KEY" || -z "$REMOTE_POLICY_HOST" ]]; then
-  echo "[launcher] Set SSH_HOST, SSH_KEY, and REMOTE_POLICY_HOST (see GUIDE_DEPLOY.md)." >&2
-  exit 1
-fi
+if [[ "${SKIP_TUNNEL:-0}" == "1" ]]; then
+  RL_ONLINE=1
+  POLICY_PREFETCH_STEPS=0
+  LOCAL_POLICY_HOST="${LOCAL_POLICY_HOST:-127.0.0.1}"
+  LOCAL_POLICY_PORT="${LOCAL_POLICY_PORT:-15555}"
+  echo "[launcher] SKIP_TUNNEL: using ${LOCAL_POLICY_HOST}:${LOCAL_POLICY_PORT} (reverse tunnel is already up)"
+else
+  if [[ -z "$SSH_HOST" || -z "$SSH_KEY" || -z "$REMOTE_POLICY_HOST" ]]; then
+    echo "[launcher] Set SSH_HOST, SSH_KEY, and REMOTE_POLICY_HOST (see GUIDE_DEPLOY.md)." >&2
+    exit 1
+  fi
 
-if [[ ! -r "$SSH_KEY" ]]; then
-  echo "[launcher] SSH key is not readable: $SSH_KEY" >&2
-  exit 1
-fi
+  if [[ ! -r "$SSH_KEY" ]]; then
+    echo "[launcher] SSH key is not readable: $SSH_KEY" >&2
+    exit 1
+  fi
 
-policy_tunnel_start
+  policy_tunnel_start
+fi
 
 cd "$REPO_ROOT"
 export UNITREE_DDSINTERFACE="$DDS_INTERFACE"
