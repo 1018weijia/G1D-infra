@@ -143,6 +143,7 @@ class RLTRollout:
     def _stitch_loop(self) -> None:
         while True:
             item = self._stitch_queue.get()
+            chunk = None
             try:
                 if item is None:
                     return
@@ -157,6 +158,9 @@ class RLTRollout:
                         "prompt": "",
                     }
                 )
+            except Exception:
+                if chunk is not None and "step_observations" not in chunk:
+                    chunk["step_observations"] = []
             finally:
                 self._stitch_queue.task_done()
 
@@ -206,11 +210,18 @@ class RLTRollout:
     def chunk_finished(self) -> bool:
         return self.open is not None and self.open["remaining"] <= 0
 
-    def take_open(self) -> Optional[dict]:
+    def wait_step_images(self) -> None:
+        """Block until background stitching started before this call has finished."""
         self._flush_step_images()
+
+    def detach_open(self) -> Optional[dict]:
         chunk = self.open
         self.open = None
         return chunk
+
+    def take_open(self) -> Optional[dict]:
+        self._flush_step_images()
+        return self.detach_open()
 
     def interrupt(self):
         """Drop a chunk that rollback cut off.
@@ -218,7 +229,7 @@ class RLTRollout:
         Returns ``("discard", chunk)`` when no step ran, or
         ``("transition", chunk)`` when the human cut in after some steps.
         """
-        chunk = self.take_open()
+        chunk = self.detach_open()
         if chunk is None:
             return None
         executed = int(chunk["queue_len"]) - int(chunk["remaining"])

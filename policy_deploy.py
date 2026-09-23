@@ -102,12 +102,24 @@ KEY_LISTENER_STOP = threading.Event()
 RL_ONLINE = False
 RL_OUTCOME_REQUEST = None
 RL_PENDING_STEP_REWARD = 0.0
+RL_EPISODE_CLOSING = False
+RL_TAKEOVER_REQUEST = False
 
 
 def on_press(key):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
     global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT, RL_OUTCOME_REQUEST
-    global RL_PENDING_STEP_REWARD
+    global RL_PENDING_STEP_REWARD, RL_EPISODE_CLOSING, RL_TAKEOVER_REQUEST
+    if RL_ONLINE and RL_EPISODE_CLOSING and key in ("s", "a"):
+        if key == "s":
+            START_POLICY = True
+            RL_TAKEOVER_REQUEST = False
+            logger_mp.info("[on_press] S queued: the next episode starts when this failure report finishes.")
+        else:
+            RL_TAKEOVER_REQUEST = True
+            START_POLICY = False
+            logger_mp.info("[on_press] A queued: hold this pose and align for takeover.")
+        return
     if RL_ONLINE and key in ("y", "n", "p"):
         if RUN_PHASE != POLICY_LIVE:
             logger_mp.warning("[on_press] %s ignored outside POLICY_LIVE (phase=%s).", key.upper(), RUN_PHASE)
@@ -246,7 +258,7 @@ def _write_xr_grippers(left_gripper_value, right_gripper_value, tele_data, input
 
 
 def _snapshot_cameras(img_client):
-    """Copy the latest camera frames without stitching them."""
+    """Copy the latest compressed frames. Stitching happens off the control loop."""
     frames = []
     for getter in (
         img_client.get_head_frame,
@@ -254,11 +266,28 @@ def _snapshot_cameras(img_client):
         img_client.get_right_wrist_frame,
     ):
         image = getter()
-        bgr = None if image is None else getattr(image, "bgr", None)
+        if image is None:
+            return None
+        jpg = getattr(image, "jpg", None)
+        if jpg:
+            frames.append(bytes(jpg))
+            continue
+        bgr = getattr(image, "bgr", None)
         if bgr is None:
             return None
         frames.append(np.ascontiguousarray(bgr))
     return tuple(frames)
+
+
+def _stitch_step_cameras(adapter, head, left, right):
+    def as_bgr(item):
+        if isinstance(item, (bytes, bytearray)):
+            decoded = cv2.imdecode(np.frombuffer(item, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is None:
+                raise RuntimeError("failed to decode a step camera frame")
+            return decoded
+        return item
+    return adapter.stitch_rgb(as_bgr(head), as_bgr(left), as_bgr(right))
 
 
 def _prepare_policy_request(adapter, img_client, arm_ctrl):
@@ -296,6 +325,13 @@ def _truncate_model_actions(adapter, actions):
 
 def _run_rlt_job(adapter, remote, job, instruction):
     """Send one Stage-2 report, then optionally request the next chunk."""
+    flush_steps = job.get("flush_steps")
+    if flush_steps is not None:
+        flush_steps()
+        pending_chunk = job.get("pending_chunk")
+        spec = job.get("transition")
+        if pending_chunk is not None and spec is not None:
+            spec["step_observations"] = list(pending_chunk.get("step_observations") or [])
     discard_id = job.get("discard_id")
     if discard_id:
         remote.discard(discard_id)
@@ -1003,9 +1039,54 @@ if __name__ == "__main__":
                 _write_xr_grippers(
                     left_gripper_value, right_gripper_value, tele_data, args.input_mode
                 )
-            START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
-                RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
-            )
+            if args.rl_online and RL_EPISODE_CLOSING and START_POLICY:
+                _, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
+                    RUN_PHASE, False, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
+                )
+            else:
+                START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
+                    RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
+                )
+
+            if args.rl_online and RUN_PHASE != POLICY_LIVE:
+                with inference_lock:
+                    outside_result = inference_state["result"]
+                    if outside_result is not None:
+                        inference_state["result"] = None
+                    outside_error = inference_state["error"]
+                    inference_state["error"] = None
+                if outside_result is not None or outside_error is not None:
+                    rl_inflight = None
+                if isinstance(outside_result, dict) and outside_result.get("kind") == "closed":
+                    RL_EPISODE_CLOSING = False
+                    logger_mp.info("RL episode %d report finished.", rollout.episode_id)
+                elif outside_error is not None:
+                    logger_mp.error("Policy inference failed: %s", outside_error)
+
+            if (args.rl_online and RL_TAKEOVER_REQUEST and not action_queue
+                    and RUN_PHASE == POLICY_LIVE):
+                RL_TAKEOVER_REQUEST = False
+                handoff["hold_q"] = np.asarray(last_arm_q, dtype=float).copy()
+                handoff["hold_tau"] = np.asarray(last_tau, dtype=float).copy()
+                handoff["hold_grip"] = np.array(
+                    [last_left_grip, last_right_grip], dtype=float
+                )
+                try:
+                    targets = rollback_endpoint_to_xr_targets(
+                        arm_ik, tv_wrapper, handoff["hold_q"], tele_data.head_pose,
+                        args.alignment_forward_offset,
+                    )
+                    alignment.reset(targets)
+                    tv_wrapper.set_alignment_targets(targets["left"], targets["right"])
+                except Exception as align_error:
+                    logger_mp.error("Could not enter takeover alignment: %s", align_error)
+                else:
+                    policy_inference_enabled = False
+                    RUN_PHASE = ALIGNING
+                    logger_mp.info(
+                        "Holding this pose. Align the controllers and press A to take over. "
+                        "S starts another episode."
+                    )
 
             if START_POLICY and RUN_PHASE == POLICY_IDLE:
                 START_POLICY = False
@@ -1102,6 +1183,8 @@ if __name__ == "__main__":
                             # rewind correction, not an intervention flag, marks
                             # it as the bad branch.
                             job.update(_rlt_transition_job(chunk, frame, state, None, False))
+                            job["flush_steps"] = rollout.wait_step_images
+                            job["pending_chunk"] = chunk
                         if plan is not None and rollout is not None:
                             job["rewind"] = {
                                 **plan,
@@ -1218,12 +1301,27 @@ if __name__ == "__main__":
                             ready_queue["transition_id"], len(action_queue),
                         )
                     elif kind == "closed":
-                        policy_inference_enabled = False
-                        RUN_PHASE = POLICY_IDLE
-                        logger_mp.info(
-                            "RL episode %d ended. Press S to start another.",
-                            rollout.episode_id,
-                        )
+                        RL_EPISODE_CLOSING = False
+                        if START_POLICY:
+                            RUN_PHASE = POLICY_IDLE
+                            policy_inference_enabled = False
+                            logger_mp.info(
+                                "RL episode %d ended. Starting the next one.",
+                                rollout.episode_id,
+                            )
+                        elif RL_TAKEOVER_REQUEST:
+                            policy_inference_enabled = False
+                            logger_mp.info(
+                                "RL episode %d ended. Align and press A to take over.",
+                                rollout.episode_id,
+                            )
+                        else:
+                            policy_inference_enabled = False
+                            RUN_PHASE = POLICY_IDLE
+                            logger_mp.info(
+                                "RL episode %d ended. Press S to start another.",
+                                rollout.episode_id,
+                            )
                 elif ready_queue is not None:
                     if action_queue:
                         action_queue.extend(ready_queue)
@@ -1259,7 +1357,9 @@ if __name__ == "__main__":
                                 rollout.on_step(
                                     state=state_now,
                                     cameras=cameras,
-                                    stitch=adapter.stitch_rgb,
+                                    stitch=lambda head, left, right: _stitch_step_cameras(
+                                        adapter, head, left, right
+                                    ),
                                 )
                         except Exception as observe_error:
                             logger_mp.debug("RL step observation skipped: %s", observe_error)
@@ -1278,7 +1378,7 @@ if __name__ == "__main__":
                             chunk = None
                             outcome = RL_OUTCOME_REQUEST
                             RL_OUTCOME_REQUEST = None
-                            chunk = rollout.take_open()
+                            chunk = rollout.detach_open()
                             if chunk is None:
                                 rl_report_due = False
                             else:
@@ -1295,6 +1395,8 @@ if __name__ == "__main__":
                                 job = _rlt_transition_job(
                                     chunk, frame, state, outcome, False
                                 )
+                                job["flush_steps"] = rollout.wait_step_images
+                                job["pending_chunk"] = chunk
                                 if not fields["done"] and policy_inference_enabled:
                                     job["act"] = (
                                         frame, state, arm_q,
@@ -1306,6 +1408,10 @@ if __name__ == "__main__":
                                     chunk = None
                                     if fields["done"]:
                                         policy_inference_enabled = False
+                                        RL_EPISODE_CLOSING = True
+                                        logger_mp.info(
+                                            "Episode outcome recorded. S starts another episode, A aligns for takeover."
+                                        )
                                 else:
                                     rollout.open = chunk
                                     chunk = None
