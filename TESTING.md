@@ -580,39 +580,39 @@ INSTRUCTION="pick up the red cup" \
 
 ### L5.2 状态机全流程
 
-**按键来自 ssh 终端 stdin，不是手柄。**
+**回退 `B` 来自 ssh 终端键盘。接管和交回来自右手柄 `A`。** 终端 `S` / `Q` 仍在键盘上；终端 `A` 只是等效备用。
 
 | # | 操作 | 预期现象 | 这步在验什么 |
 |---|---|---|---|
-| 1 | 终端按 `S` | 状态进 `POLICY_LIVE`，机械臂按 policy 动 | `POLICY_IDLE --S--> POLICY_LIVE` |
-| 2 | 按 `B` | policy 停，机械臂**倒放**最近约 3 秒，然后**停在回退终点不动** | 回退缓冲；停住说明 hold 的是最后一拍命令而不是实测角 |
+| 1 | 等日志 `Ready pose reached and held`，再终端按 `S` | 启动后双臂已在准备姿势；按 `S` 才进 `POLICY_LIVE` 并开始推理 | 抬手与推理分开：`startup --> READY_POSE --> POLICY_IDLE --S--> POLICY_LIVE` |
+| 2 | 终端按 `B` | policy 停，机械臂**倒放**最近约 3 秒；最后约 0.5 秒的路径会放慢停下，然后**停在回退终点不动、不抖** | 回退缓冲和末端减速；停住说明 hold 的是最后一拍命令而不是实测角 |
 | 3 | 看头显 | 出现 TARGET 坐标轴 | 回退终点经 FK 转成了 OpenXR TARGET |
 | 4 | 把手柄 RGB 轴对上 TARGET | 位置 ≤ 4 cm、旋转 ≤ 0.20 rad、稳 0.5 s 后提示 aligned | 对齐判据 |
-| 5 | 按 `A` | 进 `TELEOP_LIVE`，机械臂跟手；前若干秒增益从 0 渐升，**不会猛冲** | 相对接管 + blend |
-| 6 | 松开 A，等 `Teleoperation handoff active` | 打印该日志 | 防抖窗口结束 |
-| 7 | 再按一次 `A`（或 `S`） | 从当前遥操作姿态交回 policy，**不需要重新对齐** | 交回路径 |
+| 5 | 按右手柄 `A` | 进 `TELEOP_LIVE`，机械臂跟手；前若干秒增益从 0 渐升，**不会猛冲** | 相对接管 + blend |
+| 6 | 松开手柄 A，等 `Teleoperation handoff active` | 打印该日志 | 防抖窗口结束 |
+| 7 | 再按一次右手柄 `A`（或终端 `S`） | 从当前遥操作姿态交回 policy，**不需要重新对齐** | 交回路径 |
 | 8 | 重复 2–7 一次 | 行为一致 | 状态机可复用，无残留 |
-| 9 | 在 `TELEOP_LIVE` 里按 `B` | 照样进回退 | blend 期间也能中止 |
-| 10 | 按 `Q` | 干净退出，隧道关闭 | `cleanup` trap |
+| 9 | 在 `TELEOP_LIVE` 里终端按 `B` | 照样进回退 | blend 期间也能中止 |
+| 10 | 终端按 `Q` | 干净退出，隧道关闭 | `cleanup` trap |
 
 **整体成功标志**：10 步全过，且全程没有出现——
 
-- 回退播完后机械臂往回抽（第 2 步是核心回归点，对应 L1 的 `test_rollback_hold_uses_last_command_not_measured_state`）。
-- 第一次按 `A` 后机械臂突然加速（blend 没生效）。
-- 按住 `A` 被识别成「接管 + 立刻交回」（防抖失效）。
+- 回退末端还在抖，或播完后机械臂往回抽（第 2 步是核心回归点，对应 L1 的 `test_rollback_hold_uses_last_command_not_measured_state` 和 `test_ease_out_stops_on_the_recorded_endpoint`）。
+- 第一次按手柄 `A` 后机械臂突然加速（blend 没生效）。
+- 按住手柄 `A` 被识别成「接管 + 立刻交回」（松开再按才算第二次）。
 - 退出后 `15555` 端口还占着：`ss -ltn | grep 15555` 应该没输出。
 
 ### L5.3 tracking 丢失
 
 对齐阶段把手柄放下 / 遮住，让 tracking 失效。
 
-**成功标志**：机械臂**保持在回退终点**，第一次按 `A` 不启动接管。tracking 恢复后重新对齐即可继续。
+**成功标志**：机械臂**保持在回退终点**，第一次按手柄 `A` 不启动接管。tracking 恢复后重新对齐即可继续。
 
 ### L5.4 边界项（可选）
 
 | 场景 | 预期 |
 |---|---|
-| 在 `POLICY_IDLE` 直接按 `A` | 无反应 |
+| 在 `POLICY_IDLE` 直接按手柄 `A` | 无反应 |
 | 中途拔掉 GPU 机网线 | 报推理超时/失败并退出或停住，机械臂不乱动 |
 | 加 `--record` 跑一轮 | 部署过程也写出 `episode_XXXX/`，格式同 L4.3 |
 

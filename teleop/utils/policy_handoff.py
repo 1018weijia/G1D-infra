@@ -131,6 +131,19 @@ def interpret_key(key, phase, now, debounce_until, last_a_at, a_gap_s=A_GAP_S):
     return RESUME_POLICY, last_a_at
 
 
+class ButtonRisingEdge:
+    """Fire once when a polled gamepad button goes from released to pressed."""
+
+    def __init__(self):
+        self.pressed = False
+
+    def update(self, pressed):
+        pressed = bool(pressed)
+        fired = pressed and not self.pressed
+        self.pressed = pressed
+        return fired
+
+
 def stale_key_flags(phase, start_policy, resume_policy, align_confirm, rollback_request):
     """Drop latched keys that are not valid in the current phase."""
     if start_policy and phase not in (POLICY_IDLE, ALIGNING):

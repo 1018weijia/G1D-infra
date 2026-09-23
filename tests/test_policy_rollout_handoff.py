@@ -21,6 +21,7 @@ from teleop.utils.policy_handoff import (
     START_POLICY,
     TAKEOVER,
     TELEOP_LIVE,
+    ButtonRisingEdge,
     blend_should_finish,
     compute_relative_arm_command,
     interpret_key,
@@ -28,7 +29,7 @@ from teleop.utils.policy_handoff import (
     rollback_hold_from_last_command,
     stale_key_flags,
 )
-from teleop.utils.rollback import PolicyRollbackBuffer
+from teleop.utils.rollback import PolicyRollbackBuffer, ease_out_playback
 
 
 class PolicyRolloutHandoffTests(unittest.TestCase):
@@ -73,6 +74,36 @@ class PolicyRolloutHandoffTests(unittest.TestCase):
         self.assertEqual(playback[-1][0][0], 0.0)
         self.assertEqual(playback[0][2], 3.0)
         self.assertEqual(len(buffer), 0)
+
+    def test_ease_out_stops_on_the_recorded_endpoint(self):
+        frames = []
+        for idx in range(30):
+            frames.append((
+                np.full(14, float(idx), dtype=float),
+                np.full(14, float(idx) * 0.1),
+                float(idx),
+                float(idx) + 0.25,
+            ))
+        eased = ease_out_playback(frames, ease_steps=12)
+        self.assertGreater(len(eased), len(frames))
+        self.assertTrue(np.allclose(eased[17][0], frames[17][0]))
+        self.assertTrue(np.allclose(eased[-1][0], frames[-1][0]))
+        self.assertTrue(np.allclose(eased[-1][1], frames[-1][1]))
+        self.assertEqual(eased[-1][2], frames[-1][2])
+        self.assertEqual(eased[-1][3], frames[-1][3])
+        steps = np.abs(np.diff(np.stack([frame[0] for frame in eased]), axis=0))
+        early = float(np.max(steps[:8]))
+        final = float(np.max(steps[-6:]))
+        self.assertGreater(early, 0.5)
+        self.assertLess(final, 0.05)
+
+    def test_gamepad_a_fires_once_per_press(self):
+        edge = ButtonRisingEdge()
+        self.assertFalse(edge.update(False))
+        self.assertTrue(edge.update(True))
+        self.assertFalse(edge.update(True))
+        self.assertFalse(edge.update(False))
+        self.assertTrue(edge.update(True))
 
     def test_handoff_helpers(self):
         self.assertEqual(smoothstep_handoff_gain(0.0, 0.3), 0.0)

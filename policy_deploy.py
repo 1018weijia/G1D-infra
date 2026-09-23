@@ -57,6 +57,7 @@ from teleop.utils.policy_handoff import (
     TELEOP_LIVE,
     alignment_state_code,
     blend_should_finish,
+    ButtonRisingEdge,
     compute_relative_arm_command,
     hold_arm_cmd,
     hold_gripper_cmd,
@@ -69,7 +70,11 @@ from teleop.utils.policy_handoff import (
     rollback_hold_from_last_command,
     stale_key_flags,
 )
-from teleop.utils.rollback import PolicyRollbackBuffer
+from teleop.utils.rollback import (
+    ROLLBACK_EASE_SECONDS,
+    PolicyRollbackBuffer,
+    ease_out_playback,
+)
 from teleop.utils.ready_pose import ReadyPoseError, load_ready_pose, move_to_ready_pose
 
 STOP = False
@@ -112,7 +117,7 @@ def on_press(key):
         logger_mp.info("[on_press] A ignored until handoff settles.")
     elif action == IGNORE_A:
         logger_mp.warning(
-            "[on_press] A ignored in %s. Press B to rollback, then A to take over.",
+            "[on_press] A ignored in %s. Press keyboard B to rollback, then gamepad A to take over.",
             RUN_PHASE,
         )
     elif action == REPEAT_A:
@@ -450,6 +455,7 @@ if __name__ == "__main__":
             protocol=args.protocol,
         )
         rollback_buffer = PolicyRollbackBuffer(args.rollback_seconds, args.frequency)
+        gamepad_a = ButtonRisingEdge()
 
         ego_overlay = None
         if args.ego_pixel_overlay:
@@ -461,8 +467,7 @@ if __name__ == "__main__":
         prefetched_queue = []
         tracking_hint_logged = False
         logger_mp.info(
-            "Connected (XR input-mode=%s). Closed loop: S=start policy, "
-            "B=rollback, A=take over, A again (or S)=return policy, Q=quit.",
+            "Connected (XR input-mode=%s). Raising both arms to the ready pose before inference.",
             args.input_mode,
         )
 
@@ -567,6 +572,35 @@ if __name__ == "__main__":
             logger_mp.info("Policy resumed from %s; waiting for chunk.", from_label)
             return True
 
+        logger_mp.info(
+            "Moving both arms to the raised ready pose (%.1fs). Press Q to abort.",
+            args.ready_pose_seconds,
+        )
+        ready_result = move_to_ready_pose(
+            arm_ctrl,
+            arm_ik,
+            ready_pose_q,
+            args.ready_pose_seconds,
+            args.frequency,
+            grippers=(last_left_grip, last_right_grip),
+            stop_requested=lambda: STOP,
+        )
+        last_arm_q = ready_result.arm_q.copy()
+        last_tau = ready_result.tau.copy()
+        if not ready_result.completed:
+            logger_mp.warning("Ready-pose motion interrupted; policy was not started.")
+            STOP = True
+        else:
+            if START_POLICY:
+                logger_mp.info(
+                    "S during the ready-pose motion was ignored. Press S again to start inference."
+                )
+            START_POLICY = False
+            logger_mp.info(
+                "Ready pose reached and held. Press keyboard S to start inference. "
+                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, Q=quit."
+            )
+
         while not STOP:
             loop_start = time.time()
             head_img = img_client.get_head_frame() if (use_zmq_display or args.record) else None
@@ -574,6 +608,8 @@ if __name__ == "__main__":
             right_wrist_img = img_client.get_right_wrist_frame() if args.record else None
 
             tele_data = tv_wrapper.get_tele_data()
+            if gamepad_a.update(getattr(tele_data, "right_ctrl_aButton", False)):
+                on_press("a")
             aligned_left_pose = tele_data.left_wrist_pose_openxr
             aligned_right_pose = tele_data.right_wrist_pose_openxr
             if args.alignment_forward_offset:
@@ -603,33 +639,13 @@ if __name__ == "__main__":
 
             if START_POLICY and RUN_PHASE == POLICY_IDLE:
                 START_POLICY = False
-                logger_mp.info(
-                    "Moving both arms to the raised ready pose before policy startup (%.1fs).",
-                    args.ready_pose_seconds,
-                )
-                ready_result = move_to_ready_pose(
-                    arm_ctrl,
-                    arm_ik,
-                    ready_pose_q,
-                    args.ready_pose_seconds,
-                    args.frequency,
-                    grippers=(last_left_grip, last_right_grip),
-                    stop_requested=lambda: STOP,
-                )
-                last_arm_q = ready_result.arm_q.copy()
-                last_tau = ready_result.tau.copy()
-                if not ready_result.completed:
-                    logger_mp.warning("Ready-pose reset interrupted; policy was not started.")
-                    if STOP:
-                        break
-                    continue
                 action_queue = []
                 prefetched_queue = []
                 policy_inference_enabled = True
                 RUN_PHASE = POLICY_LIVE
                 recording = _start_record_episode(args, recorder, recording)
                 logger_mp.info(
-                    "Ready pose reached; policy rollout started and is requesting the first chunk."
+                    "Policy rollout started from the ready pose and is requesting the first chunk."
                 )
 
             if ((START_POLICY and RUN_PHASE == ALIGNING) or
@@ -652,9 +668,15 @@ if __name__ == "__main__":
                 action_queue.clear()
                 prefetched_queue.clear()
                 reset_handoff_runtime(handoff)
-                rollback_sequence = rollback_buffer.reverse_playback(exclude_latest=True)
+                raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
+                ease_steps = max(2, int(round(ROLLBACK_EASE_SECONDS * args.frequency)))
+                rollback_sequence = ease_out_playback(raw_rollback, ease_steps)
                 RUN_PHASE = POLICY_ROLLBACK
-                logger_mp.info("Rollback requested: replaying %d frames", len(rollback_sequence))
+                logger_mp.info(
+                    "Rollback requested: replaying %d frames; slowing the last %.2fs of the path to a stop",
+                    len(rollback_sequence),
+                    ROLLBACK_EASE_SECONDS,
+                )
 
             if rollback_sequence:
                 arm_q, tau, left_grip, right_grip = rollback_sequence.pop(0)
@@ -678,7 +700,7 @@ if __name__ == "__main__":
                 measured_q = arm_ctrl.get_current_dual_arm_q()[:14]
                 logger_mp.info(
                     "Rollback complete; holding last command "
-                    "(meas-cmd max=%.4f rad). Align controllers and press A.",
+                    "(meas-cmd max=%.4f rad). Align controllers and press gamepad A.",
                     float(np.max(np.abs(np.asarray(measured_q, dtype=float) - endpoint_q))),
                 )
                 handoff["hold_q"] = endpoint_q
@@ -835,7 +857,7 @@ if __name__ == "__main__":
                         blending = True
                         A_DEBOUNCE_UNTIL = time.monotonic() + A_HANDOFF_DEBOUNCE_S
                         logger_mp.info(
-                            "Handoff confirmed. Release A, then press A again after teleop is active to return policy."
+                            "Handoff confirmed. Release gamepad A, then press it again after teleop is active to return policy."
                         )
                 ALIGNMENT_STATE = alignment.state
                 alignment_state_shared[0] = alignment_state_code(alignment.state)
@@ -906,7 +928,7 @@ if __name__ == "__main__":
                     A_DEBOUNCE_UNTIL = max(
                         A_DEBOUNCE_UNTIL, time.monotonic() + A_TELEOP_READY_DEBOUNCE_S
                     )
-                    logger_mp.info("Teleoperation handoff active. Press A again to return control to policy.")
+                    logger_mp.info("Teleoperation handoff active. Press gamepad A again to return control to policy.")
 
             if RUN_PHASE == POLICY_LIVE:
                 rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
