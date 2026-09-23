@@ -26,7 +26,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python train/serve_rlt_online.py \
 
 日志出现 `RLT online server listening on tcp://127.0.0.1:5555` 后再开隧道。服务只绑本机，不要改成 `0.0.0.0`。
 
-前 120 条 chunk（滑窗不算）返回 Motus 参考动作，样本入库，不做梯度。满 120 条之后才走 EXPO actor。成功或失败按下之后，客户端发 `episode_end`，服务才按「本回合 actor 块数 × 5」做更新。
+前 20 条 chunk（滑窗不算）返回 Motus 参考动作，样本入库，不做梯度。满 20 条之后才走 EXPO actor。成功或失败按下之后，客户端发 `episode_end`，服务才按「本回合 actor 块数 × 5」做更新。
 
 ## 2. 从训练机打反向隧道
 
