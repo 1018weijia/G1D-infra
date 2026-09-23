@@ -44,6 +44,7 @@ from teleop.utils.rlt_online import (
     SUCCESS_REWARD,
     TakeoverChunk,
     qpos_command,
+    rewind_frame_count,
     rewind_plan,
     transition_fields,
 )
@@ -1062,6 +1063,10 @@ if __name__ == "__main__":
                 raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
                 if args.rl_online and RUN_PHASE == POLICY_LIVE:
                     kind, chunk = rl_event if rl_event is not None else (None, None)
+                    executed = int(chunk.get("executed_steps", 0)) if kind == "transition" else 0
+                    raw_rollback = raw_rollback[:rewind_frame_count(
+                        executed, takeover_gate["chunk_len"]
+                    )]
                     include_current = kind == "transition"
                     plan = rewind_plan(
                         len(raw_rollback),

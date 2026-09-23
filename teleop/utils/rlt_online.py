@@ -180,28 +180,40 @@ class RLTRollout:
         return ("transition", chunk)
 
 
-def rewind_plan(frames: int, chunk_len: int, stored_chunks: int, include_current: bool) -> Optional[dict]:
-    """How a physical rollback maps onto RLinf's rewind correction.
+def rewind_frame_count(executed_steps: int, chunk_len: int) -> int:
+    """How many recorded commands to play backward for a one-chunk rewind.
 
-    A rollback that actually moves the arm is ``rewind_exit``. If the arm has
-    no history to replay but earlier chunks were stored, it falls back to
-    ``rewind_credit``, matching a transport that cannot rewind physically.
+    The newest command is the pose already being held, so it is not replayed.
+    A chunk that has started rewinds only the steps it executed. Otherwise the
+    previous full chunk is rewound.
     """
+    chunk_len = max(1, int(chunk_len))
+    steps = int(executed_steps) if int(executed_steps) > 0 else chunk_len
+    return max(0, steps - 1)
+
+
+def rewind_plan(frames: int, chunk_len: int, stored_chunks: int, include_current: bool) -> Optional[dict]:
+    """Map one physical rollback onto a one-chunk RLinf rewind correction.
+
+    The bad branch is always the single latest chunk. ``chunk_len`` is accepted
+    so callers can keep passing it; the playback length is chosen separately by
+    ``rewind_frame_count``. No motion and no open chunk falls back to
+    ``rewind_credit``.
+    """
+    del chunk_len
     available = int(stored_chunks) + (1 if include_current else 0)
     if available <= 0:
         return None
-    chunk_len = max(1, int(chunk_len))
-    if int(frames) <= 0:
+    if int(frames) <= 0 and not include_current:
         return {
             "mode": "credit",
             "chunks": 1,
             "terminal_reward": REWIND_TERMINAL_REWARD,
             "prefix_reward": REWIND_PREFIX_REWARD,
         }
-    span = max(1, (int(frames) + chunk_len - 1) // chunk_len)
     return {
         "mode": "exit",
-        "chunks": min(span, available),
+        "chunks": 1,
         "terminal_reward": REWIND_TERMINAL_REWARD,
         "prefix_reward": 0.0,
     }

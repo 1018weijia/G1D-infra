@@ -13,6 +13,7 @@ from teleop.utils.rlt_online import (
     TakeoverChunk,
     chunk_rewards,
     qpos_command,
+    rewind_frame_count,
     rewind_plan,
     transition_fields,
 )
@@ -100,10 +101,12 @@ class RLTOnlineTests(unittest.TestCase):
         self.assertAlmostEqual(float(command[15]), 4.25)
 
     def test_rewind_plan_matches_rlinf_exit_and_credit(self):
-        physical = rewind_plan(frames=70, chunk_len=64, stored_chunks=3, include_current=True)
+        physical = rewind_plan(frames=90, chunk_len=64, stored_chunks=3, include_current=True)
         self.assertEqual(physical["mode"], "exit")
-        self.assertEqual(physical["chunks"], 2)
+        self.assertEqual(physical["chunks"], 1)
         self.assertEqual(physical["terminal_reward"], -0.2)
+        self.assertEqual(rewind_frame_count(20, 64), 19)
+        self.assertEqual(rewind_frame_count(0, 64), 63)
         credit = rewind_plan(frames=0, chunk_len=64, stored_chunks=2, include_current=False)
         self.assertEqual(credit["mode"], "credit")
         self.assertEqual(credit["chunks"], 1)
