@@ -363,10 +363,12 @@ class PolicyRemoteClient:
         chunk_id: int,
         session_id: str = "g1d",
         env_id: int = 0,
+        observation: Optional[dict] = None,
     ) -> dict:
         """Ask the Stage-2 server for one residual-actor chunk.
 
         The reply must contain ``transition_id`` and ``actions`` of shape ``(T, 16)``.
+        ``observation`` is a ZMQ observation captured earlier (a queued takeover chunk).
         """
         identity = {
             "episode_id": int(episode_id),
@@ -374,10 +376,15 @@ class PolicyRemoteClient:
             "env_id": int(env_id),
             "chunk_id": int(chunk_id),
         }
+        if observation is not None and self.protocol != "zmq":
+            raise NotImplementedError("prebuilt observations need the ZMQ protocol")
         if self.protocol == "zmq":
             payload = {
                 REQUEST_KEY: REQUEST_ACT,
-                "observation": observation_zmq(frame_rgb, state, instruction),
+                "observation": (
+                    observation if observation is not None
+                    else observation_zmq(frame_rgb, state, instruction)
+                ),
                 "identity": identity,
             }
         else:
@@ -419,6 +426,7 @@ class PolicyRemoteClient:
         session_id: str = "g1d",
         env_id: int = 0,
         step_observations=None,
+        next_observation: Optional[dict] = None,
     ) -> dict:
         """Send the observation that follows an executed chunk."""
         rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
@@ -429,11 +437,16 @@ class PolicyRemoteClient:
             "env_id": int(env_id),
             "chunk_id": int(chunk_id),
         }
+        if next_observation is not None and self.protocol != "zmq":
+            raise NotImplementedError("prebuilt observations need the ZMQ protocol")
         if self.protocol == "zmq":
             payload = {
                 REQUEST_KEY: REQUEST_TRANSITION,
                 "transition_id": str(transition_id),
-                "next_observation": observation_zmq(next_frame_rgb, next_state, instruction),
+                "next_observation": (
+                    next_observation if next_observation is not None
+                    else observation_zmq(next_frame_rgb, next_state, instruction)
+                ),
                 "rewards": rewards,
                 "done": bool(done),
                 "bootstrap_mask": float(bootstrap_mask),

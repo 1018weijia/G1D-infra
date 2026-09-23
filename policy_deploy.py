@@ -10,6 +10,7 @@ import time
 import tty
 from multiprocessing import Array
 
+import cv2
 import numpy as np
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
@@ -42,9 +43,11 @@ from teleop.utils.rlt_online import (
     PROGRESS_REWARD,
     RLTRollout,
     SUCCESS_REWARD,
-    TakeoverChunk,
+    TeleopChunker,
     TeleopMotionGate,
     outcome_ends_without_chunk,
+    resolve_observation,
+    resolve_step_observations,
     qpos_command,
     rewind_frame_count,
     rewind_plan,
@@ -326,15 +329,69 @@ def _truncate_model_actions(adapter, actions):
     return actions
 
 
-def _run_rlt_job(adapter, remote, job, instruction):
+def _note_stride(rollout, reply):
+    stride = reply.get("step_window_stride")
+    if rollout is not None and stride is not None:
+        rollout.step_obs_stride = int(stride)
+
+
+def _upload_takeover_chunk(remote, chunk, instruction, rollout):
+    """act on the chunk's first observation for an id, then store the human actions."""
+    start = resolve_observation(chunk["start"])
+    nxt = resolve_observation(chunk["next"])
+    actions = np.asarray(chunk["actions"], dtype=np.float32)
+    if start is None or nxt is None:
+        logger_mp.error(
+            "Takeover chunk %s dropped: its boundary camera frame was not captured.",
+            chunk["chunk_id"],
+        )
+        return {"kind": "reported"}
+    start = dict(start, prompt=instruction)
+    nxt = dict(nxt, prompt=instruction)
+    steps = resolve_step_observations(chunk["step_observations"], actions.shape[0])
+    for item in steps:
+        if item is not None:
+            item["prompt"] = instruction
+    reply = remote.act(
+        None, None, instruction,
+        episode_id=chunk["episode_id"], chunk_id=chunk["chunk_id"], observation=start,
+    )
+    _note_stride(rollout, reply)
+    remote.report_transition(
+        reply["transition_id"], None, None, instruction,
+        np.zeros(actions.shape[0], dtype=np.float32),
+        done=False,
+        bootstrap_mask=1.0,
+        action_chunk=actions,
+        intervention=True,
+        episode_id=chunk["episode_id"],
+        chunk_id=chunk["chunk_id"],
+        step_observations=steps,
+        next_observation=nxt,
+    )
+    logger_mp.info(
+        "RL takeover chunk sent id=%s chunk=%d steps=%d step_obs=%d",
+        reply["transition_id"], chunk["chunk_id"], actions.shape[0],
+        sum(item is not None for item in steps),
+    )
+    return {"kind": "reported"}
+
+
+def _run_rlt_job(adapter, remote, job, instruction, rollout=None):
     """Send one Stage-2 report, then optionally request the next chunk."""
     flush_steps = job.get("flush_steps")
     if flush_steps is not None:
         flush_steps()
+    spec = job.get("transition")
+    if spec is not None:
         pending_chunk = job.get("pending_chunk")
-        spec = job.get("transition")
-        if pending_chunk is not None and spec is not None:
-            spec["step_observations"] = list(pending_chunk.get("step_observations") or [])
+        source = (
+            pending_chunk.get("step_observations") if pending_chunk is not None
+            else spec.get("step_observations")
+        )
+        spec["step_observations"] = resolve_step_observations(source, len(spec["action_chunk"]))
+    if job.get("takeover") is not None:
+        return _upload_takeover_chunk(remote, job["takeover"], instruction, rollout)
     discard_id = job.get("discard_id")
     if discard_id:
         remote.discard(discard_id)
@@ -355,7 +412,8 @@ def _run_rlt_job(adapter, remote, job, instruction):
     if spec is not None:
         step_observations = spec.get("step_observations") or []
         for item in step_observations:
-            item["prompt"] = instruction
+            if item is not None:
+                item["prompt"] = instruction
         remote.report_transition(
             spec["transition_id"],
             spec["next_frame"],
@@ -402,6 +460,7 @@ def _run_rlt_job(adapter, remote, job, instruction):
     reply = remote.act(
         frame, state, instruction, episode_id=episode_id, chunk_id=chunk_id,
     )
+    _note_stride(rollout, reply)
     model_actions = _truncate_model_actions(adapter, reply["actions"])
     queue = adapter.build_exec_queue(
         model_actions, arm_q,
@@ -417,8 +476,6 @@ def _run_rlt_job(adapter, remote, job, instruction):
         "queue": queue,
         "transition_id": reply["transition_id"],
         "model_actions": model_actions,
-        "hold_actions": bool(job.get("hold_actions")),
-        "issued_chunk_id": None if act is None else int(act[4]),
     }
 
 
@@ -674,17 +731,14 @@ if __name__ == "__main__":
         rollback_sequence = []
         policy_inference_enabled = False
         rollout = RLTRollout() if args.rl_online else None
-        takeover = TakeoverChunk()
         teleop_gate = TeleopMotionGate()
-        # arming: an act is in flight whose actions must not move the arm.
-        # after: what to do when that act returns ("discard", "resume", or None).
-        # rows: human commands captured while that act is still in flight.
-        takeover_gate = {"arming": False, "after": None, "rows": [], "chunk_len": 64, "issued_chunk_id": 0}
+        # Human chunks are cut locally and queued; teleop never waits on the server.
+        teleop_chunker = TeleopChunker()
         rl_report_due = False
         rl_inflight = None
         rl_deferred = []
         idle_discard_id = None
-        idle_end_cancelled = False
+        upload_wait_log_time = 0.0
         last_arm_q = hold_q.copy()
         last_tau = hold_tau.copy()
         last_left_grip = left_hold_grip
@@ -704,8 +758,9 @@ if __name__ == "__main__":
         def inference_worker(request, generation):
             try:
                 if isinstance(request, dict) and request.get("rlt"):
-                    result = _run_rlt_job(adapter, remote, request, args.instruction)
-                    if request.get("transition") is not None and rollout is not None:
+                    result = _run_rlt_job(adapter, remote, request, args.instruction, rollout)
+                    stored = request.get("transition") is not None or request.get("takeover") is not None
+                    if stored and rollout is not None:
                         rollout.note_stored()
                     discard_id = None
                     with inference_lock:
@@ -808,85 +863,44 @@ if __name__ == "__main__":
             }
 
         def _send_or_defer(job):
-            """Reports must reach the server even if the worker is busy right now."""
-            if not start_inference(job):
+            """Reports reach the server in order, even if the worker is busy right now."""
+            if rl_deferred or not start_inference(job):
                 rl_deferred.append(job)
-
-        def _arm_takeover():
-            if (not args.rl_online or takeover.active or takeover_gate["arming"]
-                    or rl_deferred or inference_busy()):
                 return False
-            try:
-                request = _rlt_act_request(
-                    _prepare_policy_request(adapter, img_client, arm_ctrl)
-                )
-            except Exception as error:
-                logger_mp.error("Takeover observation failed: %s", error)
-                return False
-            request["hold_actions"] = True
-            takeover_gate["issued_chunk_id"] = int(request["act"][4])
-            takeover_gate["rows"] = []
-            if not start_inference(request):
-                return False
-            takeover_gate["arming"] = True
             return True
 
-        def _takeover_job(identity, actions, next_act):
-            frame, state, arm_q = _prepare_policy_request(adapter, img_client, arm_ctrl)
-            if actions.shape[0] == 0:
-                job = {"rlt": True, "discard_id": identity["transition_id"]}
-            else:
-                job = _rlt_transition_job(
-                    {
-                        "transition_id": identity["transition_id"],
-                        "episode_id": identity["episode_id"],
-                        "chunk_id": identity["chunk_id"],
-                        "actions": actions,
-                        "executed_steps": int(actions.shape[0]),
-                    },
-                    frame, state, None, True,
-                )
-            if next_act:
-                job["act"] = (
-                    frame, state, arm_q, rollout.episode_id, rollout.next_chunk_id,
-                )
-                job["hold_actions"] = next_act == "hold"
-                if next_act == "hold":
-                    takeover_gate["issued_chunk_id"] = int(job["act"][4])
-                    takeover_gate["rows"] = []
-                    takeover_gate["arming"] = True
-            return job
-
-        def _commit_takeover(next_act):
-            if not takeover.active:
-                return False
-            if inference_busy():
-                logger_mp.error(
-                    "Takeover report is busy; chunk %s was not sent",
-                    takeover.transition_id,
-                )
-                return False
-            closed = takeover.close()
-            if closed is None:
-                return False
-            identity, actions, _executed = closed
+        def _capture_observation(arm_q14, left_grip, right_grip):
+            """Snapshot cameras now; stitch and JPEG-encode off the control thread."""
             try:
-                job = _takeover_job(identity, actions, next_act)
+                cameras = _snapshot_cameras(img_client)
+                if cameras is None:
+                    return None
+                state_now = adapter.build_state(arm_q14, left_grip, right_grip)
             except Exception as error:
-                logger_mp.error("Takeover observation failed: %s", error)
-                takeover_gate["arming"] = False
-                return False
-            if not start_inference(job):
-                takeover_gate["arming"] = False
-                logger_mp.error(
-                    "Could not report takeover chunk %s", identity["transition_id"]
-                )
-                return False
-            logger_mp.info(
-                "Takeover chunk id=%s steps=%d next=%s",
-                identity["transition_id"], int(actions.shape[0]), next_act or "none",
+                logger_mp.debug("Teleop observation skipped: %s", error)
+                return None
+            return rollout.queue_observation(
+                cameras,
+                lambda head, left, right: _stitch_step_cameras(adapter, head, left, right),
+                state_now,
             )
-            return True
+
+        def _queue_teleop_chunk(next_obs):
+            chunk = teleop_chunker.close(next_obs)
+            if chunk is None:
+                return
+            _send_or_defer({"rlt": True, "takeover": chunk, "flush_steps": rollout.wait_step_images})
+            logger_mp.info(
+                "Takeover chunk %d recorded: steps=%d uploads_waiting=%d",
+                chunk["chunk_id"], int(chunk["actions"].shape[0]), len(rl_deferred),
+            )
+
+        def _flush_teleop_chunk():
+            """Close the open human chunk at the current pose (A back to policy, or B)."""
+            if not teleop_chunker.active:
+                return
+            arm_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
+            _queue_teleop_chunk(_capture_observation(arm_q, *_read_grippers(arm_ctrl)))
 
         def _hold_policy_pose(from_label):
             """Stop following the hands now. The next act is requested when the worker is free."""
@@ -910,59 +924,10 @@ if __name__ == "__main__":
             )
 
         def _enter_policy_from_takeover():
-            """Leave teleop at once. Never wait on the server here.
-
-            The human chunk is reported, and the next act requested, by the
-            POLICY_LIVE loop once the worker is free.
-            """
-            if takeover_gate["arming"] or takeover.active:
-                takeover_gate["after"] = "resume"
-            else:
-                takeover_gate["after"] = None
+            """Leave teleop at once. Recorded human chunks upload before the next policy act."""
+            _flush_teleop_chunk()
             _hold_policy_pose("teleop pose")
             return True
-
-        def _takeover_pending():
-            return takeover_gate["arming"] or takeover_gate["after"] == "resume"
-
-        def _accept_hold(result):
-            takeover_gate["arming"] = False
-            follow = takeover_gate["after"]
-            takeover_gate["after"] = None
-            if follow == "discard" or (RUN_PHASE != TELEOP_LIVE and follow != "resume"):
-                takeover_gate["rows"] = []
-                _send_or_defer({"rlt": True, "discard_id": result["transition_id"]})
-                return
-            chunk_len = int(np.asarray(result["model_actions"]).shape[0])
-            takeover_gate["chunk_len"] = chunk_len
-            issued = result.get("issued_chunk_id")
-            if issued is None:
-                issued = takeover_gate["issued_chunk_id"]
-            takeover.open(
-                result["transition_id"], rollout.episode_id, int(issued), chunk_len,
-            )
-            rollout.next_chunk_id = max(rollout.next_chunk_id, int(issued) + 1)
-            for row in takeover_gate["rows"][:chunk_len]:
-                takeover.push(row)
-            takeover_gate["rows"] = []
-            logger_mp.info(
-                "Takeover recording id=%s steps_already=%d",
-                result["transition_id"], takeover.steps,
-            )
-            if follow == "resume":
-                takeover_gate["after"] = "resume"
-                return
-            if takeover.steps >= takeover.chunk_len:
-                _commit_takeover("hold")
-
-        def _pop_hold_result():
-            with inference_lock:
-                ready = inference_state["result"]
-                if not (isinstance(ready, dict) and ready.get("hold_actions")):
-                    return None
-                inference_state["result"] = None
-                inference_state["error"] = None
-            return ready
 
         def try_resume_policy(from_label):
             global RUN_PHASE
@@ -1065,17 +1030,10 @@ if __name__ == "__main__":
                     RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
                 )
 
-            if args.rl_online:
-                held = _pop_hold_result()
-                if held is not None:
-                    _accept_hold(held)
-
             if args.rl_online and RUN_PHASE != POLICY_LIVE:
                 with inference_lock:
                     outside_result = inference_state["result"]
-                    if isinstance(outside_result, dict) and outside_result.get("hold_actions"):
-                        outside_result = None
-                    elif outside_result is not None:
+                    if outside_result is not None:
                         inference_state["result"] = None
                     outside_error = inference_state["error"]
                     inference_state["error"] = None
@@ -1093,21 +1051,6 @@ if __name__ == "__main__":
 
             if args.rl_online and rl_deferred and start_inference(rl_deferred[0]):
                 rl_deferred.pop(0)
-
-            if args.rl_online and takeover_gate["arming"]:
-                with inference_lock:
-                    hold_lost = (
-                        inference_state["thread"] is None
-                        and inference_state["result"] is None
-                    )
-                if hold_lost:
-                    takeover_gate["arming"] = False
-                    takeover_gate["rows"] = []
-                    if takeover_gate["after"] == "resume":
-                        takeover_gate["after"] = None
-                    logger_mp.warning(
-                        "Takeover act was dropped by the server or cancelled; not recording this takeover chunk."
-                    )
 
             if (args.rl_online and RL_TAKEOVER_REQUEST and not action_queue
                     and RUN_PHASE == POLICY_LIVE):
@@ -1146,11 +1089,7 @@ if __name__ == "__main__":
                     RL_PENDING_STEP_REWARD = 0.0
                     rl_report_due = False
                     idle_discard_id = None
-                    idle_end_cancelled = False
-                    takeover_gate["after"] = None
-                    takeover_gate["rows"] = []
-                    if takeover.active:
-                        takeover.close()
+                    teleop_chunker.close(None)
                     episode_id = rollout.begin_episode()
                     logger_mp.info(
                         "RL episode %d started from the ready pose. Y=success, N=failure.",
@@ -1192,32 +1131,28 @@ if __name__ == "__main__":
                     RL_OUTCOME_REQUEST = None
                     rl_event = rollout.interrupt()
                 if args.rl_online:
-                    takeover_gate["arming"] = False
-                    takeover_gate["after"] = None
-                    takeover_gate["rows"] = []
+                    _flush_teleop_chunk()
                 policy_inference_enabled = False
                 invalidate_inference()
                 action_queue.clear()
                 prefetched_queue.clear()
-                if args.rl_online and takeover.active:
-                    closed = takeover.close()
-                    if closed is not None:
-                        try:
-                            _send_or_defer(_takeover_job(closed[0], closed[1], None))
-                        except Exception as report_error:
-                            logger_mp.error("Takeover report before rollback failed: %s", report_error)
                 raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
                 if args.rl_online and RUN_PHASE == POLICY_LIVE:
                     kind, chunk = rl_event if rl_event is not None else (None, None)
                     executed = int(chunk.get("executed_steps", 0)) if kind == "transition" else 0
                     raw_rollback = raw_rollback[:rewind_frame_count(
-                        executed, takeover_gate["chunk_len"]
+                        executed, teleop_chunker.chunk_len
                     )]
                     include_current = kind == "transition"
+                    queued = sum(
+                        1 for queued_job in rl_deferred
+                        if queued_job.get("takeover") is not None
+                        or queued_job.get("transition") is not None
+                    )
                     plan = rewind_plan(
                         len(raw_rollback),
-                        takeover_gate["chunk_len"],
-                        0 if rollout is None else rollout.stored_chunks,
+                        teleop_chunker.chunk_len,
+                        (0 if rollout is None else rollout.stored_chunks) + queued,
                         include_current,
                     )
                     try:
@@ -1241,12 +1176,12 @@ if __name__ == "__main__":
                                 "chunk_id": rollout.next_chunk_id,
                             }
                         if job.keys() != {"rlt"}:
-                            if start_inference(job):
+                            if _send_or_defer(job):
                                 rl_inflight = job
                             else:
-                                rl_deferred.append(job)
                                 logger_mp.info(
-                                    "Rollback report queued; it is sent after the current RL request."
+                                    "Rollback report queued; it is sent after %d earlier RL reports.",
+                                    len(rl_deferred) - 1,
                                 )
                     except Exception as report_error:
                         logger_mp.error(
@@ -1336,9 +1271,7 @@ if __name__ == "__main__":
                     rl_inflight = None
                 if isinstance(ready_queue, dict):
                     kind = ready_queue.get("kind")
-                    if kind == "act" and ready_queue.get("hold_actions"):
-                        _accept_hold(ready_queue)
-                    elif kind == "act":
+                    if kind == "act":
                         if outcome_ends_without_chunk(
                             RL_OUTCOME_REQUEST, rollout.open is not None, len(action_queue),
                         ):
@@ -1350,7 +1283,7 @@ if __name__ == "__main__":
                         else:
                             model_actions = ready_queue.get("model_actions")
                             if model_actions is not None:
-                                takeover_gate["chunk_len"] = int(np.asarray(model_actions).shape[0])
+                                teleop_chunker.chunk_len = int(np.asarray(model_actions).shape[0])
                             action_queue = list(ready_queue["queue"])
                             rollout.accept_chunk(
                                 ready_queue["transition_id"],
@@ -1496,75 +1429,65 @@ if __name__ == "__main__":
                                 "RL transition observation failed; retrying: %s",
                                 request_error,
                             )
-                    elif (takeover_gate["after"] == "resume" and takeover.active
-                            and not worker_busy and not rl_deferred
-                            and rollout.open is None and not action_queue):
-                        # With Y/N already pressed, report the human chunk
-                        # without asking for another policy chunk.
-                        next_act = None if RL_OUTCOME_REQUEST else "execute"
-                        try:
-                            _commit_takeover(next_act)
-                        except Exception as resume_error:
-                            logger_mp.error(
-                                "Takeover report failed while handing control back: %s",
-                                resume_error,
-                            )
-                        if not takeover.active:
-                            takeover_gate["after"] = None
                     elif outcome_ends_without_chunk(
                             RL_OUTCOME_REQUEST, rollout.open is not None, len(action_queue),
                     ):
-                        if worker_busy or rl_deferred:
-                            if worker_busy and not idle_end_cancelled:
-                                invalidate_inference()
-                                idle_end_cancelled = True
-                                logger_mp.info(
-                                    "No chunk is running. Cancelling the request still in flight."
-                                )
-                        else:
-                            outcome = RL_OUTCOME_REQUEST
-                            job = {
-                                "rlt": True,
-                                "episode_end_only": True,
-                                "success": outcome == "success",
-                                "episode_id": rollout.episode_id,
-                                "terminal_reward": float(RL_PENDING_STEP_REWARD),
-                            }
-                            if idle_discard_id:
-                                job["discard_id"] = idle_discard_id
-                            if start_inference(job):
-                                RL_OUTCOME_REQUEST = None
-                                RL_PENDING_STEP_REWARD = 0.0
-                                idle_discard_id = None
-                                idle_end_cancelled = False
-                                policy_inference_enabled = False
-                                RL_EPISODE_CLOSING = False
-                                RL_TAKEOVER_REQUEST = False
-                                START_POLICY = False
-                                action_queue = []
-                                logger_mp.info(
-                                    "No chunk is running. Ending as %s and returning to the ready pose.",
-                                    outcome,
-                                )
-                                ready_result = move_to_ready_pose(
-                                    arm_ctrl,
-                                    arm_ik,
-                                    ready_pose_q,
-                                    args.ready_pose_seconds,
-                                    args.frequency,
-                                    grippers=(last_left_grip, last_right_grip),
-                                    stop_requested=lambda: STOP,
-                                )
-                                last_arm_q = ready_result.arm_q.copy()
-                                last_tau = ready_result.tau.copy()
-                                RUN_PHASE = POLICY_IDLE
-                                logger_mp.info(
-                                    "Ready pose reached. Press S to start the next episode."
-                                )
-                                continue
+                        if worker_busy:
+                            # A policy act still on the wire would start a chunk
+                            # the operator no longer wants; its reply is discarded.
+                            invalidate_inference()
+                        outcome = RL_OUTCOME_REQUEST
+                        job = {
+                            "rlt": True,
+                            "episode_end_only": True,
+                            "success": outcome == "success",
+                            "episode_id": rollout.episode_id,
+                            "terminal_reward": float(RL_PENDING_STEP_REWARD),
+                        }
+                        if idle_discard_id:
+                            job["discard_id"] = idle_discard_id
+                        _send_or_defer(job)
+                        RL_OUTCOME_REQUEST = None
+                        RL_PENDING_STEP_REWARD = 0.0
+                        idle_discard_id = None
+                        policy_inference_enabled = False
+                        RL_EPISODE_CLOSING = False
+                        RL_TAKEOVER_REQUEST = False
+                        START_POLICY = False
+                        action_queue = []
+                        logger_mp.info(
+                            "No chunk is running. Ending as %s and returning to the ready pose "
+                            "(%d RL reports still uploading).",
+                            outcome, len(rl_deferred),
+                        )
+                        ready_result = move_to_ready_pose(
+                            arm_ctrl,
+                            arm_ik,
+                            ready_pose_q,
+                            args.ready_pose_seconds,
+                            args.frequency,
+                            grippers=(last_left_grip, last_right_grip),
+                            stop_requested=lambda: STOP,
+                        )
+                        last_arm_q = ready_result.arm_q.copy()
+                        last_tau = ready_result.tau.copy()
+                        RUN_PHASE = POLICY_IDLE
+                        logger_mp.info(
+                            "Ready pose reached. Press S to start the next episode."
+                        )
+                        continue
                     elif (policy_inference_enabled and rollout.open is None
-                            and not rl_report_due and not action_queue and not worker_busy
-                            and not rl_deferred and not _takeover_pending()):
+                            and not rl_report_due and not action_queue
+                            and (worker_busy or rl_deferred)):
+                        now = time.monotonic()
+                        if rl_deferred and now - upload_wait_log_time >= 5.0:
+                            logger_mp.info(
+                                "Holding pose: %d RL reports upload before the next policy chunk.",
+                                len(rl_deferred),
+                            )
+                            upload_wait_log_time = now
+                    elif (policy_inference_enabled and rollout.open is None
+                            and not rl_report_due and not action_queue):
                         try:
                             request = _rlt_act_request(
                                 _prepare_policy_request(adapter, img_client, arm_ctrl)
@@ -1763,23 +1686,20 @@ if __name__ == "__main__":
                         )
                         if not teleop_gate.seeded:
                             teleop_gate.reset(command, left_pose, right_pose)
-                        elif teleop_gate.should_count(command, left_pose, right_pose, commit=False):
-                            # The chunk observation is taken at the first real
-                            # move, not while the operator is still settling.
-                            recorded = True
-                            if takeover_gate["arming"]:
-                                if len(takeover_gate["rows"]) < takeover_gate["chunk_len"]:
-                                    takeover_gate["rows"].append(command)
-                            elif takeover.active:
-                                if (takeover.push(command)
-                                        and not rl_deferred and not inference_busy()):
-                                    _commit_takeover("hold")
-                            elif _arm_takeover():
-                                takeover_gate["rows"].append(command)
-                            else:
-                                recorded = False
-                            if recorded:
-                                teleop_gate.reset(command, left_pose, right_pose)
+                        elif teleop_gate.should_count(command, left_pose, right_pose):
+                            grips = (tele_left_grip, tele_right_grip)
+                            if teleop_chunker.full or not teleop_chunker.active:
+                                # This observation ends the previous chunk and
+                                # starts the next, taken at the first real move.
+                                boundary = _capture_observation(current_lr_arm_q, *grips)
+                                if teleop_chunker.full:
+                                    _queue_teleop_chunk(boundary)
+                                teleop_chunker.open(boundary, rollout.episode_id, rollout.next_chunk_id)
+                                rollout.next_chunk_id += 1
+                            step_obs = None
+                            if rollout.step_obs_wanted(teleop_chunker.steps):
+                                step_obs = _capture_observation(current_lr_arm_q, *grips)
+                            teleop_chunker.push(command, step_obs)
 
             last_arm_q = np.asarray(sol_q[:14], dtype=float).copy()
             last_tau = np.asarray(sol_tauff[:14], dtype=float).copy()

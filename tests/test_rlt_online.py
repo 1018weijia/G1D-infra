@@ -11,11 +11,13 @@ from teleop.utils.policy_client import PolicyRemoteClient
 from teleop.utils.rlt_online import (
     REQUEST_KEY,
     RLTRollout,
-    TakeoverChunk,
+    TeleopChunker,
     TeleopMotionGate,
     chunk_rewards,
     outcome_ends_without_chunk,
     qpos_command,
+    resolve_observation,
+    resolve_step_observations,
     rewind_frame_count,
     rewind_plan,
     transition_fields,
@@ -126,10 +128,11 @@ class RLTOnlineTests(unittest.TestCase):
         chunk = rollout.take_open()
         self.assertEqual(chunk["rewards"].tolist(), [0.5, 1.0])
 
-    def test_step_images_stitch_off_the_control_call(self):
+    def test_step_images_stitch_only_the_window_offsets(self):
         rollout = RLTRollout()
+        rollout.step_obs_stride = 2
         rollout.begin_episode()
-        rollout.accept_chunk("t-img", np.zeros((1, 16), dtype=np.float32), 1)
+        rollout.accept_chunk("t-img", np.zeros((5, 16), dtype=np.float32), 5)
         seen = []
 
         def stitch(head, left, right):
@@ -137,17 +140,31 @@ class RLTOnlineTests(unittest.TestCase):
             return np.zeros((4, 4, 3), dtype=np.uint8)
 
         blank = np.zeros((2, 2, 3), dtype=np.uint8)
-        rollout.on_step(
-            state=np.zeros(16, dtype=np.float32),
-            cameras=(blank, blank, blank),
-            stitch=stitch,
-        )
+        for _ in range(5):
+            rollout.on_step(
+                state=np.zeros(16, dtype=np.float32),
+                cameras=(blank, blank, blank),
+                stitch=stitch,
+            )
         chunk = rollout.take_open()
-        self.assertEqual(len(seen), 1)
-        self.assertEqual(
-            _decode(chunk["step_observations"][0]["observation/image_jpeg"]).shape, (4, 4, 3)
-        )
-        self.assertEqual(chunk["step_observations"][0]["observation/state"].shape, (16,))
+        self.assertEqual(len(seen), 2)
+        steps = resolve_step_observations(chunk["step_observations"], 5)
+        self.assertEqual([item is not None for item in steps], [False, False, True, False, True])
+        self.assertEqual(_decode(steps[2]["observation/image_jpeg"]).shape, (4, 4, 3))
+        self.assertEqual(steps[4]["observation/state"].shape, (16,))
+
+    def test_a_failed_stitch_leaves_that_step_empty(self):
+        rollout = RLTRollout()
+        rollout.step_obs_stride = 1
+
+        def broken(head, left, right):
+            raise RuntimeError("camera frame did not decode")
+
+        blank = np.zeros((2, 2, 3), dtype=np.uint8)
+        holder = rollout.queue_observation((blank, blank, blank), broken, np.zeros(16))
+        rollout.wait_step_images()
+        self.assertIsNone(resolve_observation(holder))
+        self.assertEqual(rollout.stitch_failures, 1)
 
     def test_takeover_commands_match_policy_layout(self):
         arm = np.arange(1, 15, dtype=np.float32)
@@ -171,20 +188,30 @@ class RLTOnlineTests(unittest.TestCase):
         self.assertEqual(credit["prefix_reward"], 0.1)
         self.assertIsNone(rewind_plan(0, 64, 0, False))
 
-    def test_takeover_chunk_fills_then_closes(self):
-        chunk = TakeoverChunk()
-        self.assertIsNone(chunk.close())
-        chunk.open("t9", episode_id=2, chunk_id=1, chunk_len=2)
-        self.assertFalse(chunk.push(qpos_command(np.zeros(14), 1.0, 2.0)))
-        self.assertTrue(chunk.push(qpos_command(np.ones(14), 3.0, 4.0)))
-        identity, actions, executed = chunk.close()
-        self.assertEqual(identity["transition_id"], "t9")
-        self.assertEqual(identity["chunk_id"], 1)
-        self.assertEqual(executed, 2)
-        self.assertEqual(actions.shape, (2, 16))
-        self.assertAlmostEqual(float(actions[1, 7]), 3.0)
-        self.assertFalse(chunk.active)
-        self.assertIsNone(chunk.close())
+    def test_teleop_chunks_chain_their_boundary_observations(self):
+        chunker = TeleopChunker(chunk_len=2)
+        self.assertIsNone(chunker.close(None))
+        first_obs, boundary, last_obs = {"obs": "o0"}, {"obs": "o2"}, {"obs": "o3"}
+        chunker.open(first_obs, episode_id=2, chunk_id=1)
+        self.assertFalse(chunker.push(qpos_command(np.zeros(14), 1.0, 2.0)))
+        self.assertTrue(chunker.push(qpos_command(np.ones(14), 3.0, 4.0), {"obs": "step1"}))
+        with self.assertRaises(RuntimeError):
+            chunker.push(qpos_command(np.ones(14), 3.0, 4.0))
+        done = chunker.close(boundary)
+        self.assertIs(done["start"], first_obs)
+        self.assertIs(done["next"], boundary)
+        self.assertEqual(done["chunk_id"], 1)
+        self.assertEqual(done["actions"].shape, (2, 16))
+        self.assertAlmostEqual(float(done["actions"][1, 7]), 3.0)
+        self.assertEqual(resolve_step_observations(done["step_observations"], 2), [None, "step1"])
+        chunker.open(boundary, episode_id=2, chunk_id=2)
+        chunker.push(qpos_command(np.zeros(14), 1.0, 2.0))
+        partial = chunker.close(last_obs)
+        self.assertIs(partial["start"], boundary)
+        self.assertEqual(partial["actions"].shape, (1, 16))
+        self.assertFalse(chunker.active)
+        chunker.open(last_obs, episode_id=2, chunk_id=3)
+        self.assertIsNone(chunker.close(None))
 
     def test_zmq_act_transition_and_sft_predict(self):
         ctx = zmq.Context()
@@ -222,6 +249,15 @@ class RLTOnlineTests(unittest.TestCase):
             client.episode_end(success=True, episode_id=3)
             client.episode_end(success=True, episode_id=4, terminal_reward=1.0)
             actions, _predict_ms = client.predict(frame, state, "倒豆子")
+            queued_start = {"observation/image_jpeg": b"start", "observation/state": state, "prompt": "倒豆子"}
+            queued_next = {"observation/image_jpeg": b"next", "observation/state": state, "prompt": "倒豆子"}
+            human = client.act(None, None, "倒豆子", episode_id=5, chunk_id=2, observation=queued_start)
+            client.report_transition(
+                human["transition_id"], None, None, "倒豆子", np.zeros(4, dtype=np.float32),
+                done=False, bootstrap_mask=1.0, action_chunk=np.zeros((4, 16), dtype=np.float32),
+                intervention=True, step_observations=[None, None, queued_start, None],
+                next_observation=queued_next,
+            )
             self.assertEqual(actions.shape, (4, 16))
         finally:
             client.close()
@@ -232,8 +268,13 @@ class RLTOnlineTests(unittest.TestCase):
 
         kinds = [item.get(REQUEST_KEY) for item in seen]
         self.assertEqual(
-            kinds, ["act", "transition", "discard", "episode_end", "episode_end", None]
+            kinds,
+            ["act", "transition", "discard", "episode_end", "episode_end", None, "act", "transition"],
         )
+        self.assertEqual(seen[6]["observation"]["observation/image_jpeg"], b"start")
+        self.assertEqual(seen[7]["next_observation"]["observation/image_jpeg"], b"next")
+        self.assertTrue(seen[7]["intervention"])
+        self.assertEqual([item is None for item in seen[7]["step_observations"]], [True, True, False, True])
         self.assertNotIn("close_last", seen[3])
         self.assertTrue(seen[4]["close_last"])
         self.assertAlmostEqual(seen[4]["terminal_reward"], 1.0)

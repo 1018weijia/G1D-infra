@@ -6,11 +6,14 @@ stitched RGB frame; ZMQ carries the array, WebSocket carries a JPEG.
 """
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from typing import Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 REQUEST_KEY = "rlt/request"
 REQUEST_ACT = "act"
@@ -66,6 +69,19 @@ def outcome_ends_without_chunk(outcome, chunk_open: bool, queued_steps: int) -> 
     return outcome in ("success", "failure") and not chunk_open and int(queued_steps) <= 0
 
 
+def resolve_observation(holder) -> Optional[dict]:
+    """Observation from a stitch holder, or None if it was skipped or failed."""
+    if not isinstance(holder, dict):
+        return None
+    return holder.get("obs")
+
+
+def resolve_step_observations(entries, length: int) -> list:
+    """Exactly ``length`` step observations; steps without one stay None."""
+    resolved = [resolve_observation(entry) for entry in list(entries or [])[: int(length)]]
+    return resolved + [None] * (int(length) - len(resolved))
+
+
 def chunk_rewards(length: int, outcome: Optional[str]) -> np.ndarray:
     """Per-step rewards. Only a success writes +1 on the last step."""
     rewards = np.zeros(int(length), dtype=np.float32)
@@ -113,6 +129,9 @@ class RLTRollout:
         self.stored_chunks = 0
         self.open: Optional[dict] = None
         self.outcome: Optional[str] = None
+        # The server reports its window stride with every act reply.
+        self.step_obs_stride = 4
+        self.stitch_failures = 0
         self._stitch_queue: queue.Queue = queue.Queue()
         self._stitch_thread: Optional[threading.Thread] = None
 
@@ -162,49 +181,55 @@ class RLTRollout:
     def _stitch_loop(self) -> None:
         while True:
             item = self._stitch_queue.get()
-            chunk = None
             try:
                 if item is None:
                     return
-                chunk, stitch, head, left, right, state = item
-                chunk["step_observations"].append(
-                    {
-                        "observation/image_jpeg": encode_jpeg_rgb(stitch(head, left, right)),
-                        "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
-                        "prompt": "",
-                    }
-                )
+                holder, stitch, head, left, right, state = item
+                holder["obs"] = {
+                    "observation/image_jpeg": encode_jpeg_rgb(stitch(head, left, right)),
+                    "observation/state": state,
+                    "prompt": "",
+                }
             except Exception:
-                if chunk is not None and "step_observations" not in chunk:
-                    chunk["step_observations"] = []
+                self.stitch_failures += 1
+                if self.stitch_failures == 1:
+                    logger.exception("RL step observation stitch failed; later failures are counted only")
             finally:
                 self._stitch_queue.task_done()
+
+    def queue_observation(self, cameras, stitch, state) -> dict:
+        """Stitch one observation off the control thread. ``holder["obs"]`` fills in later."""
+        holder: dict = {"obs": None}
+        head, left, right = cameras
+        self._ensure_stitcher()
+        self._stitch_queue.put((
+            holder, stitch, head, left, right,
+            np.asarray(state, dtype=np.float32).reshape(-1).copy(),
+        ))
+        return holder
+
+    def step_obs_wanted(self, index: int) -> bool:
+        """The server builds windows at offsets stride, 2*stride, ... < chunk."""
+        stride = int(self.step_obs_stride)
+        return stride > 0 and index > 0 and index % stride == 0
 
     def on_step(self, frame_rgb=None, state=None, cameras=None, stitch=None) -> None:
         if self.open is None or self.open["remaining"] <= 0:
             return
         chunk = self.open
+        index = int(chunk["queue_len"]) - int(chunk["remaining"])
         chunk["remaining"] -= 1
-        if cameras is not None and stitch is not None and state is not None:
-            head, left, right = cameras
-            self._ensure_stitcher()
-            self._stitch_queue.put((
-                chunk,
-                stitch,
-                head,
-                left,
-                right,
-                np.asarray(state, dtype=np.float32).reshape(-1).copy(),
-            ))
-            return
-        if frame_rgb is not None and state is not None:
-            chunk["step_observations"].append(
-                {
+        entry = None
+        if self.step_obs_wanted(index) and state is not None:
+            if cameras is not None and stitch is not None:
+                entry = self.queue_observation(cameras, stitch, state)
+            elif frame_rgb is not None:
+                entry = {"obs": {
                     "observation/image_jpeg": encode_jpeg_rgb(frame_rgb),
                     "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
                     "prompt": "",
-                }
-            )
+                }}
+        chunk["step_observations"].append(entry)
 
     def _flush_step_images(self) -> None:
         if self._stitch_thread is None:
@@ -364,62 +389,54 @@ class TeleopMotionGate:
         return moved
 
 
-class TakeoverChunk:
-    """Human joint commands recorded against one pending ``act``.
+class TeleopChunker:
+    """Cut counted teleop steps into chunks locally, without waiting on the server.
 
-    The server already stored the observation at ``act`` time. These rows are
-    the actions that observation should be paired with, so behavior cloning
-    follows the operator instead of the action the policy had proposed.
+    Each chunk keeps the observation at its first step. The next chunk's first
+    observation is this chunk's next observation, as in remote-franka's
+    continuous Gello takeover. Chunks are uploaded later as act + transition.
     """
 
-    def __init__(self):
-        self.transition_id: Optional[str] = None
-        self.episode_id = 0
-        self.chunk_id = 0
-        self.chunk_len = 0
-        self.rows: list = []
+    def __init__(self, chunk_len: int = 64):
+        self.chunk_len = int(chunk_len)
+        self._chunk: Optional[dict] = None
 
     @property
     def active(self) -> bool:
-        return self.transition_id is not None
+        return self._chunk is not None
 
     @property
     def steps(self) -> int:
-        return len(self.rows)
+        return 0 if self._chunk is None else len(self._chunk["actions"])
 
-    def open(self, transition_id: str, episode_id: int, chunk_id: int, chunk_len: int) -> None:
-        self.transition_id = str(transition_id)
-        self.episode_id = int(episode_id)
-        self.chunk_id = int(chunk_id)
-        self.chunk_len = int(chunk_len)
-        self.rows = []
+    @property
+    def full(self) -> bool:
+        return self._chunk is not None and self.steps >= self.chunk_len
 
-    def push(self, action) -> bool:
-        if not self.active:
-            raise RuntimeError("takeover chunk is not open")
-        self.rows.append(np.asarray(action, dtype=np.float32).reshape(-1).copy())
-        return self.steps >= self.chunk_len
-
-    def close(self):
-        """Return ``(identity, actions [T, 16], executed)`` and forget the act.
-
-        ``executed`` is 0 when the operator left before any command was recorded.
-        The caller discards that pending act.
-        """
-        if not self.active:
-            return None
-        identity = {
-            "transition_id": self.transition_id,
-            "episode_id": int(self.episode_id),
-            "chunk_id": int(self.chunk_id),
+    def open(self, start_obs, episode_id: int, chunk_id: int) -> None:
+        self._chunk = {
+            "start": start_obs,
+            "episode_id": int(episode_id),
+            "chunk_id": int(chunk_id),
+            "actions": [],
+            "step_observations": [],
         }
-        if self.rows:
-            limit = self.chunk_len if self.chunk_len > 0 else len(self.rows)
-            actions = np.stack(self.rows[:limit], axis=0).astype(np.float32)
-        else:
-            actions = np.zeros((0, 16), dtype=np.float32)
-        executed = int(actions.shape[0])
-        self.transition_id = None
-        self.rows = []
-        self.chunk_len = 0
-        return identity, actions, executed
+
+    def push(self, action, step_obs=None) -> bool:
+        """Add one counted step. Returns True once the chunk holds ``chunk_len`` steps."""
+        if self._chunk is None:
+            raise RuntimeError("teleop chunk is not open")
+        if self.full:
+            raise RuntimeError("teleop chunk is full; close it first")
+        self._chunk["actions"].append(np.asarray(action, dtype=np.float32).reshape(-1).copy())
+        self._chunk["step_observations"].append(step_obs)
+        return self.full
+
+    def close(self, next_obs) -> Optional[dict]:
+        """Finish the chunk. Returns None when it has no steps."""
+        chunk, self._chunk = self._chunk, None
+        if chunk is None or not chunk["actions"]:
+            return None
+        chunk["actions"] = np.stack(chunk["actions"], axis=0).astype(np.float32)
+        chunk["next"] = next_obs
+        return chunk
