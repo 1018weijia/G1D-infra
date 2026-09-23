@@ -40,6 +40,8 @@ from teleop.utils.rlt_online import (
     RL_MAX_ABS_ARM_Q,
     RL_MAX_ABS_GRIPPER_Q,
     RLTRollout,
+    TakeoverChunk,
+    qpos_command,
     transition_fields,
 )
 from teleop.utils.policy_handoff import (
@@ -293,6 +295,10 @@ def _run_rlt_job(adapter, remote, job, instruction):
         )
     act = job.get("act")
     if act is None:
+        # A finished episode has no next act. A takeover report doesn't either,
+        # and must not be treated as the episode ending.
+        if spec is not None and not spec.get("done"):
+            return {"kind": "reported"}
         return {"kind": "closed"}
     frame, state, arm_q, episode_id, chunk_id = act
     reply = remote.act(
@@ -313,6 +319,8 @@ def _run_rlt_job(adapter, remote, job, instruction):
         "queue": queue,
         "transition_id": reply["transition_id"],
         "model_actions": model_actions,
+        "hold_actions": bool(job.get("hold_actions")),
+        "issued_chunk_id": None if act is None else int(act[4]),
     }
 
 
@@ -568,6 +576,11 @@ if __name__ == "__main__":
         rollback_sequence = []
         policy_inference_enabled = False
         rollout = RLTRollout() if args.rl_online else None
+        takeover = TakeoverChunk()
+        # arming: an act is in flight whose actions must not move the arm.
+        # after: what to do when that act returns ("discard", "resume", or None).
+        # rows: human commands captured while that act is still in flight.
+        takeover_gate = {"arming": False, "after": None, "rows": [], "chunk_len": 64, "issued_chunk_id": 0}
         rl_report_due = False
         rl_inflight = None
         last_arm_q = hold_q.copy()
@@ -668,19 +681,177 @@ if __name__ == "__main__":
             }
 
         def _rlt_transition_job(chunk, frame, state, outcome, intervention):
-            fields = transition_fields(int(chunk["actions"].shape[0]), outcome, intervention)
+            actions = np.asarray(chunk["actions"], dtype=np.float32)
+            executed = int(chunk.get("executed_steps", actions.shape[0]))
+            executed = max(0, min(executed, int(actions.shape[0])))
+            actions = actions[:executed]
+            fields = transition_fields(int(actions.shape[0]), outcome, intervention)
             return {
                 "rlt": True,
                 "transition": {
                     "transition_id": chunk["transition_id"],
                     "next_frame": frame,
                     "next_state": state,
-                    "action_chunk": chunk["actions"],
+                    "action_chunk": actions,
                     "episode_id": chunk["episode_id"],
                     "chunk_id": chunk["chunk_id"],
                     **fields,
                 },
             }
+
+        def _arm_takeover():
+            if (not args.rl_online or takeover.active or takeover_gate["arming"]
+                    or inference_busy()):
+                return False
+            try:
+                request = _rlt_act_request(
+                    _prepare_policy_request(adapter, img_client, arm_ctrl)
+                )
+            except Exception as error:
+                logger_mp.error("Takeover observation failed: %s", error)
+                return False
+            request["hold_actions"] = True
+            takeover_gate["issued_chunk_id"] = int(request["act"][4])
+            takeover_gate["rows"] = []
+            if not start_inference(request):
+                return False
+            takeover_gate["arming"] = True
+            return True
+
+        def _takeover_job(identity, actions, next_act):
+            frame, state, arm_q = _prepare_policy_request(adapter, img_client, arm_ctrl)
+            if actions.shape[0] == 0:
+                job = {"rlt": True, "discard_id": identity["transition_id"]}
+            else:
+                job = _rlt_transition_job(
+                    {
+                        "transition_id": identity["transition_id"],
+                        "episode_id": identity["episode_id"],
+                        "chunk_id": identity["chunk_id"],
+                        "actions": actions,
+                        "executed_steps": int(actions.shape[0]),
+                    },
+                    frame, state, None, True,
+                )
+            if next_act:
+                job["act"] = (
+                    frame, state, arm_q, rollout.episode_id, rollout.next_chunk_id,
+                )
+                job["hold_actions"] = next_act == "hold"
+                if next_act == "hold":
+                    takeover_gate["issued_chunk_id"] = int(job["act"][4])
+                    takeover_gate["rows"] = []
+                    takeover_gate["arming"] = True
+            return job
+
+        def _commit_takeover(next_act):
+            closed = takeover.close()
+            if closed is None:
+                return False
+            identity, actions, _executed = closed
+            if inference_busy():
+                logger_mp.error(
+                    "Takeover report is busy; chunk %s was not sent",
+                    identity["transition_id"],
+                )
+                return False
+            try:
+                job = _takeover_job(identity, actions, next_act)
+            except Exception as error:
+                logger_mp.error("Takeover observation failed: %s", error)
+                takeover_gate["arming"] = False
+                return False
+            if not start_inference(job):
+                takeover_gate["arming"] = False
+                logger_mp.error(
+                    "Could not report takeover chunk %s", identity["transition_id"]
+                )
+                return False
+            logger_mp.info(
+                "Takeover chunk id=%s steps=%d next=%s",
+                identity["transition_id"], int(actions.shape[0]), next_act or "none",
+            )
+            return True
+
+        def _enter_policy_from_takeover():
+            global RUN_PHASE, action_queue, policy_inference_enabled, recording
+            global last_arm_q, last_tau, last_left_grip, last_right_grip
+            if takeover_gate["arming"] or inference_busy():
+                takeover_gate["after"] = "resume"
+                return False
+            if takeover.active:
+                if not _commit_takeover("execute"):
+                    return False
+            else:
+                try:
+                    request = _rlt_act_request(
+                        _prepare_policy_request(adapter, img_client, arm_ctrl)
+                    )
+                except Exception as error:
+                    logger_mp.error("Policy resume observation failed: %s", error)
+                    return False
+                if not start_inference(request):
+                    return False
+            resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
+            resume_left, resume_right = _read_grippers(arm_ctrl)
+            arm_ik.reset_solution_state(resume_q)
+            arm_ctrl.set_policy_gripper_q(resume_left, resume_right)
+            action_queue = []
+            policy_inference_enabled = True
+            last_arm_q = resume_q.copy()
+            last_tau = arm_ik.solve_tau(resume_q).copy()
+            last_left_grip, last_right_grip = resume_left, resume_right
+            clear_handoff_runtime()
+            RUN_PHASE = POLICY_LIVE
+            recording = _start_record_episode(args, recorder, recording)
+            logger_mp.info("Policy resumed from teleop; waiting for chunk.")
+            return True
+
+        def _accept_hold(result):
+            global RESUME_POLICY
+            takeover_gate["arming"] = False
+            follow = takeover_gate["after"]
+            takeover_gate["after"] = None
+            if follow == "discard" or RUN_PHASE != TELEOP_LIVE:
+                discard = {"rlt": True, "discard_id": result["transition_id"]}
+                takeover_gate["rows"] = []
+                if not start_inference(discard):
+                    logger_mp.error(
+                        "Could not discard unused takeover act %s",
+                        result["transition_id"],
+                    )
+                return
+            chunk_len = int(np.asarray(result["model_actions"]).shape[0])
+            takeover_gate["chunk_len"] = chunk_len
+            issued = result.get("issued_chunk_id")
+            if issued is None:
+                issued = takeover_gate["issued_chunk_id"]
+            takeover.open(
+                result["transition_id"], rollout.episode_id, int(issued), chunk_len,
+            )
+            rollout.next_chunk_id = max(rollout.next_chunk_id, int(issued) + 1)
+            for row in takeover_gate["rows"][:chunk_len]:
+                takeover.push(row)
+            takeover_gate["rows"] = []
+            logger_mp.info(
+                "Takeover recording id=%s steps_already=%d",
+                result["transition_id"], takeover.steps,
+            )
+            if follow == "resume":
+                if _enter_policy_from_takeover():
+                    RESUME_POLICY = False
+                return
+            if takeover.steps >= takeover.chunk_len:
+                _commit_takeover("hold")
+
+        def _pop_hold_result():
+            with inference_lock:
+                ready = inference_state["result"]
+                if not (isinstance(ready, dict) and ready.get("hold_actions")):
+                    return None
+                inference_state["result"] = None
+                inference_state["error"] = None
+            return ready
 
         def try_resume_policy(from_label):
             global RUN_PHASE
@@ -800,7 +971,22 @@ if __name__ == "__main__":
                         "Policy rollout started from the ready pose and is requesting the first chunk."
                     )
 
-            if ((START_POLICY and RUN_PHASE == ALIGNING) or
+            if args.rl_online:
+                held = _pop_hold_result()
+                if held is not None:
+                    _accept_hold(held)
+
+            if args.rl_online and RESUME_POLICY and RUN_PHASE == TELEOP_LIVE and (
+                    takeover_gate["arming"] or takeover.active):
+                try:
+                    if _enter_policy_from_takeover():
+                        RESUME_POLICY = False
+                except Exception as resume_error:
+                    logger_mp.error(
+                        "Failed to resume policy from teleop; will retry: %s",
+                        resume_error,
+                    )
+            elif ((START_POLICY and RUN_PHASE == ALIGNING) or
                     (RESUME_POLICY and RUN_PHASE == TELEOP_LIVE)):
                 from_label = "alignment pose" if RUN_PHASE == ALIGNING else "teleop pose"
                 try:
@@ -821,6 +1007,12 @@ if __name__ == "__main__":
                     rl_inflight = None
                     RL_OUTCOME_REQUEST = None
                     rl_event = rollout.interrupt()
+                elif args.rl_online and RUN_PHASE == TELEOP_LIVE:
+                    if takeover_gate["arming"]:
+                        takeover_gate["after"] = "discard"
+                        takeover_gate["rows"] = []
+                    elif takeover.active:
+                        _commit_takeover(None)
                 policy_inference_enabled = False
                 invalidate_inference()
                 action_queue.clear()
@@ -931,7 +1123,12 @@ if __name__ == "__main__":
                     rl_inflight = None
                 if isinstance(ready_queue, dict):
                     kind = ready_queue.get("kind")
-                    if kind == "act":
+                    if kind == "act" and ready_queue.get("hold_actions"):
+                        _accept_hold(ready_queue)
+                    elif kind == "act":
+                        model_actions = ready_queue.get("model_actions")
+                        if model_actions is not None:
+                            takeover_gate["chunk_len"] = int(np.asarray(model_actions).shape[0])
                         action_queue = list(ready_queue["queue"])
                         rollout.accept_chunk(
                             ready_queue["transition_id"],
@@ -1201,7 +1398,12 @@ if __name__ == "__main__":
                     A_DEBOUNCE_UNTIL = max(
                         A_DEBOUNCE_UNTIL, time.monotonic() + A_TELEOP_READY_DEBOUNCE_S
                     )
-                    logger_mp.info("Teleoperation handoff active. Press gamepad A again to return control to policy.")
+                    logger_mp.info(
+                        "Teleoperation handoff active. Human joint commands are recorded for RL. "
+                        "Press gamepad A again to return control to policy."
+                    )
+                    if args.rl_online:
+                        _arm_takeover()
 
             if RUN_PHASE == POLICY_LIVE:
                 rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
@@ -1211,6 +1413,15 @@ if __name__ == "__main__":
                 else:
                     tele_left_grip, tele_right_grip = _read_grippers(arm_ctrl)
                     rollback_buffer.append(sol_q[:14], sol_tauff[:14], tele_left_grip, tele_right_grip)
+                    if args.rl_online:
+                        command = qpos_command(sol_q[:14], tele_left_grip, tele_right_grip)
+                        if takeover_gate["arming"]:
+                            if len(takeover_gate["rows"]) < takeover_gate["chunk_len"]:
+                                takeover_gate["rows"].append(command)
+                        elif takeover.active and takeover.push(command):
+                            _commit_takeover("hold")
+                        elif not takeover.active:
+                            _arm_takeover()
 
             last_arm_q = np.asarray(sol_q[:14], dtype=float).copy()
             last_tau = np.asarray(sol_tauff[:14], dtype=float).copy()

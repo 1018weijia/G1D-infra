@@ -106,6 +106,7 @@ ssh -N -R 127.0.0.1:16555:127.0.0.1:5555 unitree
 | `Y` | 当前块执行完后记成功：最后一步奖励 1，`done=true`，回到 `POLICY_IDLE` |
 | `N` | 当前块执行完后记失败：奖励全 0，`done=true`，回到 `POLICY_IDLE` |
 | `B` | 还没走出一步则 `discard`；已经走出几步则 `transition`，`intervention=true`，奖励 0，`done=false` |
+| `A` | 对齐后接管。接管期间的关节命令按块上报，`intervention=true`，行为克隆对准这些人工动作；再按一次 `A`（或 `S`）把控制交回策略 |
 
 动作仍是原始 AbsQpos，16 维 `[L7, LG, R7, RG]`，`action_chunk_space=robot`。不在机器人上做分位数归一化。上报的 `action_chunk` 是截断到实际执行长度之后、插值之前的模型动作。
 

@@ -10,7 +10,9 @@ from teleop.utils.policy_client import PolicyRemoteClient
 from teleop.utils.rlt_online import (
     REQUEST_KEY,
     RLTRollout,
+    TakeoverChunk,
     chunk_rewards,
+    qpos_command,
     transition_fields,
 )
 
@@ -82,6 +84,30 @@ class RLTOnlineTests(unittest.TestCase):
         self.assertFalse(rollout.chunk_finished())
         rollout.on_step()
         self.assertTrue(rollout.chunk_finished())
+
+    def test_takeover_commands_match_policy_layout(self):
+        arm = np.arange(1, 15, dtype=np.float32)
+        command = qpos_command(arm, 5.5, 4.25)
+        self.assertEqual(command.shape, (16,))
+        self.assertEqual(command[:7].tolist(), arm[:7].tolist())
+        self.assertEqual(command[8:15].tolist(), arm[7:14].tolist())
+        self.assertAlmostEqual(float(command[7]), 5.5)
+        self.assertAlmostEqual(float(command[15]), 4.25)
+
+    def test_takeover_chunk_fills_then_closes(self):
+        chunk = TakeoverChunk()
+        self.assertIsNone(chunk.close())
+        chunk.open("t9", episode_id=2, chunk_id=1, chunk_len=2)
+        self.assertFalse(chunk.push(qpos_command(np.zeros(14), 1.0, 2.0)))
+        self.assertTrue(chunk.push(qpos_command(np.ones(14), 3.0, 4.0)))
+        identity, actions, executed = chunk.close()
+        self.assertEqual(identity["transition_id"], "t9")
+        self.assertEqual(identity["chunk_id"], 1)
+        self.assertEqual(executed, 2)
+        self.assertEqual(actions.shape, (2, 16))
+        self.assertAlmostEqual(float(actions[1, 7]), 3.0)
+        self.assertFalse(chunk.active)
+        self.assertIsNone(chunk.close())
 
     def test_zmq_act_transition_and_sft_predict(self):
         ctx = zmq.Context()
