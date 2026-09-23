@@ -79,6 +79,11 @@ policy_tunnel_start
 
 cd "$REPO_ROOT"
 export UNITREE_DDSINTERFACE="$DDS_INTERFACE"
+RL_ARGS=()
+if [[ "${RL_ONLINE:-0}" == "1" ]]; then
+  RL_ARGS+=(--rl-online)
+  POLICY_PREFETCH_STEPS=0
+fi
 python policy_deploy.py \
   --config-path "$CONFIG_PATH" \
   --ready-pose-config "$READY_POSE_CONFIG" \
@@ -96,4 +101,5 @@ python policy_deploy.py \
   --ego-pixel-overlay \
   --rollback-seconds "${ROLLBACK_SECONDS:-3.0}" \
   --policy-prefetch-steps "${POLICY_PREFETCH_STEPS:-4}" \
+  "${RL_ARGS[@]}" \
   "$@"

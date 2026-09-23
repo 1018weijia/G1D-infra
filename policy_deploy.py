@@ -36,6 +36,12 @@ from teleop.utils.ego_projection import EgoPixelOverlay
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.handoff_utils import rollback_endpoint_to_xr_targets
 from teleop.utils.policy_client import PolicyAdapter, PolicyRemoteClient
+from teleop.utils.rlt_online import (
+    RL_MAX_ABS_ARM_Q,
+    RL_MAX_ABS_GRIPPER_Q,
+    RLTRollout,
+    transition_fields,
+)
 from teleop.utils.policy_handoff import (
     A_GAP_S,
     A_HANDOFF_DEBOUNCE_S,
@@ -87,11 +93,23 @@ ALIGNMENT_STATE = None
 A_LAST_CHAR_AT = 0.0
 A_DEBOUNCE_UNTIL = 0.0
 KEY_LISTENER_STOP = threading.Event()
+RL_ONLINE = False
+RL_OUTCOME_REQUEST = None
 
 
 def on_press(key):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
-    global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT
+    global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT, RL_OUTCOME_REQUEST
+    if RL_ONLINE and key in ("y", "n"):
+        if RUN_PHASE != POLICY_LIVE:
+            logger_mp.warning("[on_press] %s ignored outside POLICY_LIVE (phase=%s).", key.upper(), RUN_PHASE)
+            return
+        RL_OUTCOME_REQUEST = "success" if key == "y" else "failure"
+        logger_mp.info(
+            "[on_press] %s: this chunk will end the episode as %s.",
+            key.upper(), RL_OUTCOME_REQUEST,
+        )
+        return
     action, A_LAST_CHAR_AT = interpret_key(
         key, RUN_PHASE, time.monotonic(), A_DEBOUNCE_UNTIL, A_LAST_CHAR_AT, A_GAP_S,
     )
@@ -176,11 +194,14 @@ def _read_grippers(arm_ctrl):
 
 
 def _start_policy_from_current_pose(
-        adapter, img_client, arm_ctrl, arm_ik, inference_lock, inference_state, start_inference):
+        adapter, img_client, arm_ctrl, arm_ik, inference_lock, inference_state, start_inference,
+        request_fn=None):
     """Capture the current robot pose and request the next policy chunk."""
     resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
     resume_left_grip, resume_right_grip = _read_grippers(arm_ctrl)
     resume_request = _prepare_policy_request(adapter, img_client, arm_ctrl)
+    if request_fn is not None:
+        resume_request = request_fn(resume_request)
     with inference_lock:
         inference_state["result"] = None
         inference_state["error"] = None
@@ -233,6 +254,66 @@ def _predict_policy_queue(adapter, remote, request, instruction):
     queue = adapter.build_exec_queue(actions, current_arm_q)
     logger_mp.info("Policy chunk received: predict=%.1fms queue=%d", predict_ms, len(queue))
     return queue
+
+
+def _truncate_model_actions(adapter, actions):
+    actions = np.asarray(actions, dtype=np.float32)
+    limit = int(adapter.exec_chunk_steps)
+    if 0 < limit < actions.shape[0]:
+        actions = actions[:limit]
+    return actions
+
+
+def _run_rlt_job(adapter, remote, job, instruction):
+    """Send one Stage-2 report, then optionally request the next chunk."""
+    discard_id = job.get("discard_id")
+    if discard_id:
+        remote.discard(discard_id)
+        logger_mp.info("RL discard sent for %s", discard_id)
+        return {"kind": "discard"}
+    spec = job.get("transition")
+    if spec is not None:
+        remote.report_transition(
+            spec["transition_id"],
+            spec["next_frame"],
+            spec["next_state"],
+            instruction,
+            spec["rewards"],
+            done=spec["done"],
+            bootstrap_mask=spec["bootstrap_mask"],
+            action_chunk=spec["action_chunk"],
+            intervention=spec["intervention"],
+            episode_id=spec["episode_id"],
+            chunk_id=spec["chunk_id"],
+        )
+        logger_mp.info(
+            "RL transition sent id=%s done=%s intervention=%s reward_sum=%.1f",
+            spec["transition_id"], spec["done"], spec["intervention"],
+            float(np.sum(spec["rewards"])),
+        )
+    act = job.get("act")
+    if act is None:
+        return {"kind": "closed"}
+    frame, state, arm_q, episode_id, chunk_id = act
+    reply = remote.act(
+        frame, state, instruction, episode_id=episode_id, chunk_id=chunk_id,
+    )
+    model_actions = _truncate_model_actions(adapter, reply["actions"])
+    queue = adapter.build_exec_queue(
+        model_actions, arm_q,
+        max_abs_arm_q=RL_MAX_ABS_ARM_Q,
+        max_abs_gripper_q=RL_MAX_ABS_GRIPPER_Q,
+    )
+    logger_mp.info(
+        "RL act chunk=%s id=%s queue=%d",
+        chunk_id, reply["transition_id"], len(queue),
+    )
+    return {
+        "kind": "act",
+        "queue": queue,
+        "transition_id": reply["transition_id"],
+        "model_actions": model_actions,
+    }
 
 
 def _split_head_colors(head_img, camera_config):
@@ -315,6 +396,11 @@ if __name__ == "__main__":
     parser.add_argument("--policy-prefetch-steps", type=int, default=4,
                         help="Request the next chunk when this many actions remain")
     parser.add_argument(
+        "--rl-online", action="store_true",
+        help="Stage-2 online RL. Sends act, then transition after the chunk runs. "
+             "Disables prefetch. Keyboard Y marks success, N marks failure.",
+    )
+    parser.add_argument(
         "--ready-pose-config",
         default=os.path.join(REPO_ROOT, "configs", "ready_pose.json"),
         help="14-joint raised startup pose shared with replay",
@@ -350,6 +436,13 @@ if __name__ == "__main__":
         parser.error("--alignment-handoff-max-joint-speed must be positive")
     if args.policy_prefetch_steps < 0:
         parser.error("--policy-prefetch-steps must be non-negative")
+    if args.rl_online and args.policy_prefetch_steps != 0:
+        logger_mp.warning(
+            "RL online disables prefetch (was %d). The next act waits for this chunk's transition.",
+            args.policy_prefetch_steps,
+        )
+        args.policy_prefetch_steps = 0
+    RL_ONLINE = bool(args.rl_online)
     if args.frequency <= 0.0:
         parser.error("--frequency must be positive")
     if args.ready_pose_seconds <= 0.0:
@@ -474,6 +567,9 @@ if __name__ == "__main__":
         action_queue = []
         rollback_sequence = []
         policy_inference_enabled = False
+        rollout = RLTRollout() if args.rl_online else None
+        rl_report_due = False
+        rl_inflight = None
         last_arm_q = hold_q.copy()
         last_tau = hold_tau.copy()
         last_left_grip = left_hold_grip
@@ -493,6 +589,29 @@ if __name__ == "__main__":
 
         def inference_worker(request, generation):
             try:
+                if isinstance(request, dict) and request.get("rlt"):
+                    result = _run_rlt_job(adapter, remote, request, args.instruction)
+                    discard_id = None
+                    with inference_lock:
+                        fresh = (
+                            generation == inference_state["generation"]
+                            and inference_state["accept_result"]
+                        )
+                        if fresh:
+                            inference_state["result"] = result
+                            inference_state["error"] = None
+                        elif result.get("kind") == "act":
+                            discard_id = result.get("transition_id")
+                    if discard_id:
+                        try:
+                            remote.discard(discard_id)
+                            logger_mp.info("Discarded stale RL act %s", discard_id)
+                        except Exception as discard_error:
+                            logger_mp.error(
+                                "Failed to discard stale RL act %s: %s",
+                                discard_id, discard_error,
+                            )
+                    return
                 result = _predict_policy_queue(adapter, remote, request, args.instruction)
                 with inference_lock:
                     if (generation == inference_state["generation"] and
@@ -541,6 +660,28 @@ if __name__ == "__main__":
             alignment_state_shared[0] = 2
             reset_handoff_runtime(handoff)
 
+        def _rlt_act_request(request):
+            frame, state, arm_q = request
+            return {
+                "rlt": True,
+                "act": (frame, state, arm_q, rollout.episode_id, rollout.next_chunk_id),
+            }
+
+        def _rlt_transition_job(chunk, frame, state, outcome, intervention):
+            fields = transition_fields(int(chunk["actions"].shape[0]), outcome, intervention)
+            return {
+                "rlt": True,
+                "transition": {
+                    "transition_id": chunk["transition_id"],
+                    "next_frame": frame,
+                    "next_state": state,
+                    "action_chunk": chunk["actions"],
+                    "episode_id": chunk["episode_id"],
+                    "chunk_id": chunk["chunk_id"],
+                    **fields,
+                },
+            }
+
         def try_resume_policy(from_label):
             global RUN_PHASE
             global action_queue, policy_inference_enabled
@@ -558,6 +699,7 @@ if __name__ == "__main__":
                 _start_policy_from_current_pose(
                     adapter, img_client, arm_ctrl, arm_ik,
                     inference_lock, inference_state, start_inference,
+                    request_fn=_rlt_act_request if args.rl_online else None,
                 )
             )
             action_queue = []
@@ -598,7 +740,8 @@ if __name__ == "__main__":
             START_POLICY = False
             logger_mp.info(
                 "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, Q=quit."
+                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, Q=quit.%s",
+                " Y=success, N=failure." if args.rl_online else "",
             )
 
         while not STOP:
@@ -644,9 +787,18 @@ if __name__ == "__main__":
                 policy_inference_enabled = True
                 RUN_PHASE = POLICY_LIVE
                 recording = _start_record_episode(args, recorder, recording)
-                logger_mp.info(
-                    "Policy rollout started from the ready pose and is requesting the first chunk."
-                )
+                if args.rl_online:
+                    RL_OUTCOME_REQUEST = None
+                    rl_report_due = False
+                    episode_id = rollout.begin_episode()
+                    logger_mp.info(
+                        "RL episode %d started from the ready pose. Y=success, N=failure.",
+                        episode_id,
+                    )
+                else:
+                    logger_mp.info(
+                        "Policy rollout started from the ready pose and is requesting the first chunk."
+                    )
 
             if ((START_POLICY and RUN_PHASE == ALIGNING) or
                     (RESUME_POLICY and RUN_PHASE == TELEOP_LIVE)):
@@ -663,10 +815,37 @@ if __name__ == "__main__":
 
             if ROLLBACK_REQUEST and RUN_PHASE in ROLLBACK_FROM_PHASES:
                 ROLLBACK_REQUEST = False
+                rl_event = None
+                if args.rl_online and RUN_PHASE == POLICY_LIVE:
+                    rl_report_due = False
+                    rl_inflight = None
+                    RL_OUTCOME_REQUEST = None
+                    rl_event = rollout.interrupt()
                 policy_inference_enabled = False
                 invalidate_inference()
                 action_queue.clear()
                 prefetched_queue.clear()
+                if rl_event is not None:
+                    kind, chunk = rl_event
+                    try:
+                        if kind == "discard":
+                            job = {"rlt": True, "discard_id": chunk["transition_id"]}
+                        else:
+                            frame, state, _arm_q = _prepare_policy_request(
+                                adapter, img_client, arm_ctrl
+                            )
+                            job = _rlt_transition_job(chunk, frame, state, None, True)
+                        if start_inference(job):
+                            rl_inflight = job
+                        else:
+                            logger_mp.error(
+                                "Could not report interrupted RL chunk %s",
+                                chunk["transition_id"],
+                            )
+                    except Exception as report_error:
+                        logger_mp.error(
+                            "Failed to report interrupted RL chunk: %s", report_error
+                        )
                 reset_handoff_runtime(handoff)
                 raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
                 ease_steps = max(2, int(round(ROLLBACK_EASE_SECONDS * args.frequency)))
@@ -749,22 +928,116 @@ if __name__ == "__main__":
                     inference_state["error"] = None
                     worker_busy = inference_state["thread"] is not None
                 if ready_queue is not None:
+                    rl_inflight = None
+                if isinstance(ready_queue, dict):
+                    kind = ready_queue.get("kind")
+                    if kind == "act":
+                        action_queue = list(ready_queue["queue"])
+                        rollout.accept_chunk(
+                            ready_queue["transition_id"],
+                            ready_queue["model_actions"],
+                            len(action_queue),
+                        )
+                    elif kind == "closed":
+                        policy_inference_enabled = False
+                        RUN_PHASE = POLICY_IDLE
+                        logger_mp.info(
+                            "RL episode %d ended. Press S to start another.",
+                            rollout.episode_id,
+                        )
+                elif ready_queue is not None:
                     if action_queue:
                         action_queue.extend(ready_queue)
                     else:
                         action_queue = ready_queue
                 if completed_error is not None:
                     logger_mp.error("Policy inference failed; retrying: %s", completed_error)
-                    # Keep rollout live and let the normal prefetch branch retry
-                    # from the current robot pose on the next loop.
-                    policy_inference_enabled = True
+                    if args.rl_online and rl_inflight is not None and start_inference(rl_inflight):
+                        worker_busy = True
+                        logger_mp.info("Retrying the same RL request.")
+                    elif not args.rl_online:
+                        # Keep rollout live and let the normal prefetch branch retry
+                        # from the current robot pose on the next loop.
+                        policy_inference_enabled = True
+                    else:
+                        policy_inference_enabled = True
                 step = action_queue.pop(0) if action_queue else None
+                chunk_just_finished = False
                 if step is not None:
                     sol_q = step.arm_q
                     sol_tauff = arm_ik.solve_tau(sol_q)
                     cmd_left_grip = step.left_grip
                     cmd_right_grip = step.right_grip
-                if (policy_inference_enabled and
+                    if args.rl_online:
+                        rollout.on_step()
+                        if rollout.chunk_finished() and not action_queue:
+                            rl_report_due = True
+                            chunk_just_finished = True
+                if args.rl_online:
+                    if (rl_report_due and not chunk_just_finished
+                            and not worker_busy and not action_queue):
+                        try:
+                            outcome = None
+                            chunk = None
+                            outcome = RL_OUTCOME_REQUEST
+                            RL_OUTCOME_REQUEST = None
+                            chunk = rollout.take_open()
+                            if chunk is None:
+                                rl_report_due = False
+                            else:
+                                frame, state, arm_q = _prepare_policy_request(
+                                    adapter, img_client, arm_ctrl
+                                )
+                                fields = transition_fields(
+                                    int(chunk["actions"].shape[0]), outcome, False
+                                )
+                                job = _rlt_transition_job(
+                                    chunk, frame, state, outcome, False
+                                )
+                                if not fields["done"] and policy_inference_enabled:
+                                    job["act"] = (
+                                        frame, state, arm_q,
+                                        rollout.episode_id, rollout.next_chunk_id,
+                                    )
+                                if start_inference(job):
+                                    rl_inflight = job
+                                    rl_report_due = False
+                                    chunk = None
+                                    if fields["done"]:
+                                        policy_inference_enabled = False
+                                else:
+                                    rollout.open = chunk
+                                    chunk = None
+                                    RL_OUTCOME_REQUEST = outcome
+                                    logger_mp.error(
+                                        "RL transition worker is busy; will retry chunk %s",
+                                        rollout.open["transition_id"],
+                                    )
+                        except Exception as request_error:
+                            if chunk is not None:
+                                rollout.open = chunk
+                            if outcome is not None or RL_OUTCOME_REQUEST is None:
+                                RL_OUTCOME_REQUEST = outcome
+                            logger_mp.error(
+                                "RL transition observation failed; retrying: %s",
+                                request_error,
+                            )
+                    elif (policy_inference_enabled and rollout.open is None
+                            and not rl_report_due and not action_queue and not worker_busy):
+                        try:
+                            request = _rlt_act_request(
+                                _prepare_policy_request(adapter, img_client, arm_ctrl)
+                            )
+                            if start_inference(request):
+                                rl_inflight = request
+                            else:
+                                logger_mp.debug("Policy inference worker is still busy.")
+                        except Exception as request_error:
+                            logger_mp.error(
+                                "Policy observation failed; retrying: %s", request_error
+                            )
+                            policy_inference_enabled = True
+                elif (policy_inference_enabled and
                         len(action_queue) <= args.policy_prefetch_steps and
                         not worker_busy):
                     try:

@@ -17,6 +17,18 @@ import cv2
 import numpy as np
 import yaml
 
+from teleop.utils.rlt_online import (
+    ACTION_SPACE_ROBOT,
+    REQUEST_ACT,
+    REQUEST_DISCARD,
+    REQUEST_KEY,
+    REQUEST_TRANSITION,
+    RL_MAX_ABS_ARM_Q,
+    RL_MAX_ABS_GRIPPER_Q,
+    observation_ws,
+    observation_zmq,
+)
+
 logger = logging.getLogger(__name__)
 
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
@@ -338,6 +350,190 @@ class PolicyRemoteClient:
             data["predicted_actions"], data.get("processing_time_ms", 0.0)
         )
 
+    def act(
+        self,
+        frame_rgb: np.ndarray,
+        state: np.ndarray,
+        instruction: str,
+        *,
+        episode_id: int,
+        chunk_id: int,
+        session_id: str = "g1d",
+        env_id: int = 0,
+    ) -> dict:
+        """Ask the Stage-2 server for one residual-actor chunk.
+
+        The reply must contain ``transition_id`` and ``actions`` of shape ``(T, 16)``.
+        """
+        identity = {
+            "episode_id": int(episode_id),
+            "session_id": str(session_id),
+            "env_id": int(env_id),
+            "chunk_id": int(chunk_id),
+        }
+        if self.protocol == "zmq":
+            payload = {
+                REQUEST_KEY: REQUEST_ACT,
+                "observation": observation_zmq(frame_rgb, state, instruction),
+                "identity": identity,
+            }
+        else:
+            payload = {
+                REQUEST_KEY: REQUEST_ACT,
+                "type": "rlt",
+                "observation": observation_ws(
+                    frame_rgb, state, instruction, encode_jpeg_b64(frame_rgb)
+                ),
+                "identity": identity,
+            }
+        reply = self._exchange(payload)
+        actions = validate_action_chunk(
+            np.asarray(reply.get("actions"), dtype=np.float32),
+            max_abs_arm_q=RL_MAX_ABS_ARM_Q,
+            max_abs_gripper_q=RL_MAX_ABS_GRIPPER_Q,
+        ).astype(np.float32)
+        transition_id = reply.get("transition_id")
+        if transition_id is None or str(transition_id) == "":
+            raise RuntimeError("rlt act reply is missing transition_id")
+        reply["actions"] = actions
+        reply["transition_id"] = str(transition_id)
+        return reply
+
+    def report_transition(
+        self,
+        transition_id: str,
+        next_frame_rgb: np.ndarray,
+        next_state: np.ndarray,
+        instruction: str,
+        rewards: np.ndarray,
+        *,
+        done: bool,
+        bootstrap_mask: float,
+        action_chunk: np.ndarray,
+        intervention: bool = False,
+        episode_id: int = 0,
+        chunk_id: int = 0,
+        session_id: str = "g1d",
+        env_id: int = 0,
+    ) -> dict:
+        """Send the observation that follows an executed chunk."""
+        rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
+        executed = np.asarray(action_chunk, dtype=np.float32)
+        identity = {
+            "episode_id": int(episode_id),
+            "session_id": str(session_id),
+            "env_id": int(env_id),
+            "chunk_id": int(chunk_id),
+        }
+        if self.protocol == "zmq":
+            payload = {
+                REQUEST_KEY: REQUEST_TRANSITION,
+                "transition_id": str(transition_id),
+                "next_observation": observation_zmq(next_frame_rgb, next_state, instruction),
+                "rewards": rewards,
+                "done": bool(done),
+                "bootstrap_mask": float(bootstrap_mask),
+                "intervention": bool(intervention),
+                "action_chunk": executed,
+                "action_chunk_space": ACTION_SPACE_ROBOT,
+                "identity": identity,
+            }
+        else:
+            payload = {
+                REQUEST_KEY: REQUEST_TRANSITION,
+                "type": "rlt",
+                "transition_id": str(transition_id),
+                "next_observation": observation_ws(
+                    next_frame_rgb, next_state, instruction, encode_jpeg_b64(next_frame_rgb)
+                ),
+                "rewards": rewards.tolist(),
+                "done": bool(done),
+                "bootstrap_mask": float(bootstrap_mask),
+                "intervention": bool(intervention),
+                "action_chunk": executed.tolist(),
+                "action_chunk_space": ACTION_SPACE_ROBOT,
+                "identity": identity,
+            }
+        return self._exchange(payload)
+
+    def discard(self, transition_id: str) -> dict:
+        """Drop a chunk that was received but never executed."""
+        payload = {
+            REQUEST_KEY: REQUEST_DISCARD,
+            "type": "rlt",
+            "transition_id": str(transition_id),
+        }
+        return self._exchange(payload)
+
+    def _exchange(self, payload: dict) -> dict:
+        if self.protocol == "zmq":
+            return self._exchange_zmq(payload)
+        return self._exchange_ws(payload)
+
+    def _exchange_zmq(self, payload: dict) -> dict:
+        if self._closed:
+            raise RuntimeError("policy client is closed")
+        import zmq
+
+        last_err = None
+        for _ in range(2):
+            sock = None
+            try:
+                if self._closed:
+                    raise RuntimeError("policy client is closed")
+                ctx = zmq.Context.instance()
+                sock = ctx.socket(zmq.REQ)
+                sock.setsockopt(zmq.LINGER, 0)
+                sock.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
+                sock.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+                sock.connect(self._zmq_endpoint)
+                sock.send(pickle.dumps(payload))
+                reply = pickle.loads(sock.recv())
+                break
+            except Exception as exc:
+                last_err = exc
+                if self._closed:
+                    raise RuntimeError("policy client closed during inference") from exc
+                logger.warning("ZMQ request failed (%s), retrying", exc)
+            finally:
+                if sock is not None:
+                    sock.close()
+        else:
+            raise RuntimeError(f"ZMQ request failed: {last_err}") from last_err
+        if reply.get("status") == "error" or reply.get("type") == "error":
+            detail = reply.get("message") or reply.get("detail") or reply
+            raise RuntimeError(f"policy server returned error: {detail}")
+        return reply
+
+    def _exchange_ws(self, payload: dict) -> dict:
+        if self._closed:
+            raise RuntimeError("policy client is closed")
+        raw = json.dumps(payload)
+        last_err = None
+        for _ in range(2):
+            try:
+                if self._ws is None:
+                    self.connect()
+                self._ws.settimeout(self.timeout_s)
+                self._ws.send(raw)
+                resp = self._ws.recv()
+                if not resp:
+                    raise RuntimeError("empty WebSocket reply")
+                reply = json.loads(resp)
+                break
+            except Exception as exc:
+                last_err = exc
+                if self._closed:
+                    raise RuntimeError("policy client closed during inference") from exc
+                logger.warning("WebSocket send failed (%s), reconnecting", exc)
+                self._ws = None
+        else:
+            raise RuntimeError(f"WebSocket request failed: {last_err}") from last_err
+        if reply.get("status") == "error" or reply.get("type") == "error":
+            detail = reply.get("message") or reply.get("detail") or reply
+            raise RuntimeError(f"policy server returned error: {detail}")
+        return reply
+
 
 @dataclass
 class PolicyExecStep:
@@ -502,8 +698,14 @@ class PolicyAdapter:
             interpolated[:, dim] = np.interp(target, source, actions[:, dim])
         return interpolated
 
-    def build_exec_queue(self, raw_actions, current_arm_q):
-        raw_actions = validate_action_chunk(raw_actions, previous_arm_q=current_arm_q)
+    def build_exec_queue(self, raw_actions, current_arm_q,
+                         max_abs_arm_q: float = 3.5, max_abs_gripper_q: float = 5.5):
+        raw_actions = validate_action_chunk(
+            raw_actions,
+            max_abs_arm_q=max_abs_arm_q,
+            max_abs_gripper_q=max_abs_gripper_q,
+            previous_arm_q=current_arm_q,
+        )
         if 0 < self.exec_chunk_steps < raw_actions.shape[0]:
             raw_actions = raw_actions[:self.exec_chunk_steps]
         exec_actions = self.interpolate_chunk(raw_actions)

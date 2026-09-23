@@ -25,20 +25,38 @@ def main():
     print(f"mock policy server listening on {args.bind}", flush=True)
 
     served = 0
+    next_transition = 0
     try:
         while True:
             req = pickle.loads(sock.recv())
             start = time.time()
-            state = np.asarray(req.get("state"), dtype=np.float32).reshape(-1)
+            kind = req.get("rlt/request")
+            if kind == "transition" or kind == "discard":
+                sock.send(pickle.dumps({"status": "ok", "rlt/request": kind}))
+                served += 1
+                print(f"served {kind} id={req.get('transition_id')!r}", flush=True)
+                if args.requests and served >= args.requests:
+                    break
+                continue
+            if kind == "act":
+                obs = req.get("observation") or {}
+                state = np.asarray(obs.get("observation/state"), dtype=np.float32).reshape(-1)
+            else:
+                state = np.asarray(req.get("state"), dtype=np.float32).reshape(-1)
             if state.size != 16:
                 sock.send(pickle.dumps({"status": "error", "message": f"bad state dim {state.size}"}))
                 continue
             actions = np.tile(state, (args.chunk_steps, 1)).astype(np.float32)
-            sock.send(pickle.dumps({
+            reply = {
                 "status": "ok",
                 "actions": actions,
                 "predict_ms": (time.time() - start) * 1000.0,
-            }))
+            }
+            if kind == "act":
+                next_transition += 1
+                reply["transition_id"] = f"t{next_transition}"
+                reply["rlt/request"] = "act"
+            sock.send(pickle.dumps(reply))
             served += 1
             print(f"served request {served} instruction={req.get('instruction')!r} "
                   f"frame={np.asarray(req.get('first_frame')).shape}", flush=True)

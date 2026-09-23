@@ -63,7 +63,7 @@ INSTRUCTION="your task" \
 
 脚本会建立 `127.0.0.1:15555` 到远端推理端口的 SSH 隧道，然后启动 `policy_deploy.py`。退出时关掉本脚本创建的隧道。程序起来后会先用 smoothstep 在默认 3 秒内把双臂抬到 `configs/ready_pose.json` 的准备姿势并停住。看到 `Ready pose reached and held` 之后，再按键盘 `S` 才采集第一帧观测并请求动作。抬手过程中按的 `S` 不算，需要到位后再按一次。抬手时按 `Q` 会中止并退出。
 
-常用环境变量：`SSH_HOST`、`SSH_PORT`、`SSH_KEY`、`REMOTE_POLICY_HOST`、`REMOTE_POLICY_PORT`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`、`INSTRUCTION`、`CONFIG_PATH`、`ROLLBACK_SECONDS`、`READY_POSE_CONFIG`、`READY_POSE_SECONDS`、`TUNNEL_WAIT_SECONDS`（默认 60，跳板机慢时再加大）。
+常用环境变量：`SSH_HOST`、`SSH_PORT`、`SSH_KEY`、`REMOTE_POLICY_HOST`、`REMOTE_POLICY_PORT`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`、`INSTRUCTION`、`CONFIG_PATH`、`ROLLBACK_SECONDS`、`READY_POSE_CONFIG`、`READY_POSE_SECONDS`、`TUNNEL_WAIT_SECONDS`（默认 60，跳板机慢时再加大）、`RL_ONLINE`（`1` 时走 Stage 2，见下文）。
 
 准备姿势默认取自这台 G1-D 已验证的遥操作启动关节命令，顺序是左臂 7 关节、右臂 7 关节。若现场要校准姿势，复制并修改 `configs/ready_pose.json`，再通过 `READY_POSE_CONFIG` 指向新文件；不要把过渡时间设为 0，程序会拒绝瞬间跳到目标。
 
@@ -80,6 +80,32 @@ INSTRUCTION="your task" \
 7. 可重复 `键盘 B → 对齐 → 手柄 A → 手柄 A`。
 
 对齐目标位姿在 `configs/alignment_targets.json`，可用 `--alignment-target-config` 覆盖。`--alignment-forward-offset` 把 TARGET 沿头显前向挪一点，方便对轴。
+
+## Stage 2 在线 RL
+
+`RL_ONLINE=1` 时，机器人不再做开环预取。每个动作块先 `act`，整段执行完再把下一次观测作为 `transition` 发回去，然后才请求下一块。默认的 `zmq` / `ws` 部署不受影响。
+
+```bash
+RL_ONLINE=1 \
+SSH_HOST=... SSH_KEY=... REMOTE_POLICY_HOST=... \
+INSTRUCTION="倒豆子" \
+./scripts/run_deploy.sh
+```
+
+脚本会加上 `--rl-online`，并把 `POLICY_PREFETCH_STEPS` 设为 0。预取必须保持为 0：下一次 `act` 要等上一块的 `transition`。
+
+| 键 | 作用 |
+|---|---|
+| `S` | 开始一条新 episode，并发出第一块 `act` |
+| `Y` | 当前块执行完后记成功：最后一步奖励 1，`done=true`，回到 `POLICY_IDLE` |
+| `N` | 当前块执行完后记失败：奖励全 0，`done=true`，回到 `POLICY_IDLE` |
+| `B` | 还没走出一步则 `discard`；已经走出几步则 `transition`，`intervention=true`，奖励 0，`done=false` |
+
+动作仍是原始 AbsQpos，16 维 `[L7, LG, R7, RG]`，`action_chunk_space=robot`。不在机器人上做分位数归一化。上报的 `action_chunk` 是截断到实际执行长度之后、插值之前的模型动作。
+
+字段名对齐 RealWorld-RLinf 的 `rlt-online-rl/v1`（请求键 `rlt/request`，取值 `act` / `transition` / `discard`）。传输仍是现有的 ZMQ pickle（图像为 uint8 RGB）或 WebSocket JSON（图像为 JPEG base64），不是 msgpack。GPU 侧服务需要按这个传输来收。
+
+`act` 的回复必须带 `transition_id` 和 `actions`。`transition` 带同一 `transition_id`、`next_observation`、逐步 `rewards`、`done`、`bootstrap_mask`。观测键是 `observation/state`、`observation/image`（ZMQ）或 `observation/image_jpeg`（WebSocket），以及 `prompt`。
 
 ## 注意
 
