@@ -6,6 +6,8 @@ stitched RGB frame; ZMQ carries the array, WebSocket carries a JPEG.
 """
 from __future__ import annotations
 
+import queue
+import threading
 from typing import Optional
 
 import numpy as np
@@ -92,6 +94,8 @@ class RLTRollout:
         self.stored_chunks = 0
         self.open: Optional[dict] = None
         self.outcome: Optional[str] = None
+        self._stitch_queue: queue.Queue = queue.Queue()
+        self._stitch_thread: Optional[threading.Thread] = None
 
     def begin_episode(self) -> int:
         self.episode_id += 1
@@ -130,21 +134,65 @@ class RLTRollout:
         }
         return self.open
 
-    def on_step(self, frame_rgb=None, state=None) -> None:
+    def _ensure_stitcher(self) -> None:
+        if self._stitch_thread is not None:
+            return
+        self._stitch_thread = threading.Thread(target=self._stitch_loop, daemon=True)
+        self._stitch_thread.start()
+
+    def _stitch_loop(self) -> None:
+        while True:
+            item = self._stitch_queue.get()
+            try:
+                if item is None:
+                    return
+                chunk, stitch, head, left, right, state = item
+                image = np.asarray(stitch(head, left, right))
+                if image.dtype != np.uint8:
+                    image = np.clip(image, 0, 255).astype(np.uint8)
+                chunk["step_observations"].append(
+                    {
+                        "observation/image": np.ascontiguousarray(image),
+                        "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
+                        "prompt": "",
+                    }
+                )
+            finally:
+                self._stitch_queue.task_done()
+
+    def on_step(self, frame_rgb=None, state=None, cameras=None, stitch=None) -> None:
         if self.open is None or self.open["remaining"] <= 0:
             return
-        self.open["remaining"] -= 1
+        chunk = self.open
+        chunk["remaining"] -= 1
+        if cameras is not None and stitch is not None and state is not None:
+            head, left, right = cameras
+            self._ensure_stitcher()
+            self._stitch_queue.put((
+                chunk,
+                stitch,
+                head,
+                left,
+                right,
+                np.asarray(state, dtype=np.float32).reshape(-1).copy(),
+            ))
+            return
         if frame_rgb is not None and state is not None:
             image = np.asarray(frame_rgb)
             if image.dtype != np.uint8:
                 image = np.clip(image, 0, 255).astype(np.uint8)
-            self.open["step_observations"].append(
+            chunk["step_observations"].append(
                 {
                     "observation/image": np.ascontiguousarray(image),
                     "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
                     "prompt": "",
                 }
             )
+
+    def _flush_step_images(self) -> None:
+        if self._stitch_thread is None:
+            return
+        self._stitch_queue.join()
 
     def add_step_reward(self, value: float) -> None:
         """Add ``value`` onto the step that just ran."""
@@ -159,6 +207,7 @@ class RLTRollout:
         return self.open is not None and self.open["remaining"] <= 0
 
     def take_open(self) -> Optional[dict]:
+        self._flush_step_images()
         chunk = self.open
         self.open = None
         return chunk

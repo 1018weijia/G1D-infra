@@ -245,6 +245,22 @@ def _write_xr_grippers(left_gripper_value, right_gripper_value, tele_data, input
         _write_controller_grippers(left_gripper_value, right_gripper_value, tele_data)
 
 
+def _snapshot_cameras(img_client):
+    """Copy the latest camera frames without stitching them."""
+    frames = []
+    for getter in (
+        img_client.get_head_frame,
+        img_client.get_left_wrist_frame,
+        img_client.get_right_wrist_frame,
+    ):
+        image = getter()
+        bgr = None if image is None else getattr(image, "bgr", None)
+        if bgr is None:
+            return None
+        frames.append(np.ascontiguousarray(bgr))
+    return tuple(frames)
+
+
 def _prepare_policy_request(adapter, img_client, arm_ctrl):
     """Capture one observation in the main loop without contacting the cloud."""
     current_arm_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
@@ -1197,6 +1213,10 @@ if __name__ == "__main__":
                             ready_queue["model_actions"],
                             len(action_queue),
                         )
+                        logger_mp.info(
+                            "RL executing chunk id=%s steps=%d",
+                            ready_queue["transition_id"], len(action_queue),
+                        )
                     elif kind == "closed":
                         policy_inference_enabled = False
                         RUN_PHASE = POLICY_IDLE
@@ -1228,14 +1248,22 @@ if __name__ == "__main__":
                     cmd_left_grip = step.left_grip
                     cmd_right_grip = step.right_grip
                     if args.rl_online:
-                        frame_now = state_now = None
                         try:
-                            frame_now, state_now, _arm_now = _prepare_policy_request(
-                                adapter, img_client, arm_ctrl
+                            state_now = adapter.build_state(
+                                current_lr_arm_q, *_read_grippers(arm_ctrl)
                             )
+                            cameras = _snapshot_cameras(img_client)
+                            if cameras is None:
+                                rollout.on_step()
+                            else:
+                                rollout.on_step(
+                                    state=state_now,
+                                    cameras=cameras,
+                                    stitch=adapter.stitch_rgb,
+                                )
                         except Exception as observe_error:
                             logger_mp.debug("RL step observation skipped: %s", observe_error)
-                        rollout.on_step(frame_now, state_now)
+                            rollout.on_step()
                         if RL_PENDING_STEP_REWARD:
                             rollout.add_step_reward(RL_PENDING_STEP_REWARD)
                             RL_PENDING_STEP_REWARD = 0.0
@@ -1254,6 +1282,10 @@ if __name__ == "__main__":
                             if chunk is None:
                                 rl_report_due = False
                             else:
+                                logger_mp.info(
+                                    "RL chunk id=%s finished, requesting the next one.",
+                                    chunk["transition_id"],
+                                )
                                 frame, state, arm_q = _prepare_policy_request(
                                     adapter, img_client, arm_ctrl
                                 )

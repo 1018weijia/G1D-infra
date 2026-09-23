@@ -91,6 +91,27 @@ class RLTOnlineTests(unittest.TestCase):
         chunk = rollout.take_open()
         self.assertEqual(chunk["rewards"].tolist(), [0.5, 1.0])
 
+    def test_step_images_stitch_off_the_control_call(self):
+        rollout = RLTRollout()
+        rollout.begin_episode()
+        rollout.accept_chunk("t-img", np.zeros((1, 16), dtype=np.float32), 1)
+        seen = []
+
+        def stitch(head, left, right):
+            seen.append((head.shape, left.shape, right.shape))
+            return np.zeros((4, 4, 3), dtype=np.uint8)
+
+        blank = np.zeros((2, 2, 3), dtype=np.uint8)
+        rollout.on_step(
+            state=np.zeros(16, dtype=np.float32),
+            cameras=(blank, blank, blank),
+            stitch=stitch,
+        )
+        chunk = rollout.take_open()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(chunk["step_observations"][0]["observation/image"].shape, (4, 4, 3))
+        self.assertEqual(chunk["step_observations"][0]["observation/state"].shape, (16,))
+
     def test_takeover_commands_match_policy_layout(self):
         arm = np.arange(1, 15, dtype=np.float32)
         command = qpos_command(arm, 5.5, 4.25)

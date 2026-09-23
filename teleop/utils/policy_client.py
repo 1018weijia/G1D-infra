@@ -700,8 +700,7 @@ class PolicyAdapter:
         )
         return canvas.astype(np.float32) / 255.0
 
-    def build_model_input(self, head_bgr, left_wrist_bgr, right_wrist_bgr,
-                          current_arm_q, left_grip, right_grip):
+    def stitch_rgb(self, head_bgr, left_wrist_bgr, right_wrist_bgr):
         if head_bgr is None or left_wrist_bgr is None or right_wrist_bgr is None:
             raise ValueError("missing required camera frame")
         head_rgb = cv2.cvtColor(head_bgr, cv2.COLOR_BGR2RGB)
@@ -710,8 +709,9 @@ class PolicyAdapter:
         if self.swap_wrists:
             left_rgb, right_rgb = right_rgb, left_rgb
         stitched = self.build_stitched_image(head_rgb, left_rgb, right_rgb)
-        first_frame_np = (stitched * 255).astype(np.uint8)
+        return (stitched * 255).astype(np.uint8)
 
+    def build_state(self, current_arm_q, left_grip, right_grip):
         if self.action_mode != "qpos":
             raise NotImplementedError("policy handoff supports qpos action mode only")
         raw_state = np.zeros(16, dtype=np.float32)
@@ -719,8 +719,14 @@ class PolicyAdapter:
         raw_state[7:14] = current_arm_q[7:14]
         raw_state[14] = float(left_grip)
         raw_state[15] = float(right_grip)
-        state = self._to_arm_interleaved(raw_state)
-        return first_frame_np, state.astype(np.float32)
+        return self._to_arm_interleaved(raw_state).astype(np.float32)
+
+    def build_model_input(self, head_bgr, left_wrist_bgr, right_wrist_bgr,
+                          current_arm_q, left_grip, right_grip):
+        return (
+            self.stitch_rgb(head_bgr, left_wrist_bgr, right_wrist_bgr),
+            self.build_state(current_arm_q, left_grip, right_grip),
+        )
 
     def interpolate_chunk(self, actions):
         actions = np.asarray(actions, dtype=float)
