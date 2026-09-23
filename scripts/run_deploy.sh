@@ -69,7 +69,8 @@ if [[ "${SKIP_TUNNEL:-0}" == "1" ]]; then
   RL_ONLINE=1
   POLICY_PREFETCH_STEPS=0
   LOCAL_POLICY_HOST="${LOCAL_POLICY_HOST:-127.0.0.1}"
-  LOCAL_POLICY_PORT="${LOCAL_POLICY_PORT:-15555}"
+  # 15555 stays the local end of the existing tunnel to another GPU's :5555.
+  LOCAL_POLICY_PORT="${RL_LOCAL_PORT:-16555}"
   echo "[launcher] SKIP_TUNNEL: using ${LOCAL_POLICY_HOST}:${LOCAL_POLICY_PORT} (reverse tunnel is already up)"
 else
   if [[ -z "$SSH_HOST" || -z "$SSH_KEY" || -z "$REMOTE_POLICY_HOST" ]]; then
