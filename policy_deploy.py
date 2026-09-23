@@ -39,7 +39,9 @@ from teleop.utils.policy_client import PolicyAdapter, PolicyRemoteClient
 from teleop.utils.rlt_online import (
     RL_MAX_ABS_ARM_Q,
     RL_MAX_ABS_GRIPPER_Q,
+    PROGRESS_REWARD,
     RLTRollout,
+    SUCCESS_REWARD,
     TakeoverChunk,
     qpos_command,
     rewind_plan,
@@ -98,16 +100,24 @@ A_DEBOUNCE_UNTIL = 0.0
 KEY_LISTENER_STOP = threading.Event()
 RL_ONLINE = False
 RL_OUTCOME_REQUEST = None
+RL_PENDING_STEP_REWARD = 0.0
 
 
 def on_press(key):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
     global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT, RL_OUTCOME_REQUEST
-    if RL_ONLINE and key in ("y", "n"):
+    global RL_PENDING_STEP_REWARD
+    if RL_ONLINE and key in ("y", "n", "p"):
         if RUN_PHASE != POLICY_LIVE:
             logger_mp.warning("[on_press] %s ignored outside POLICY_LIVE (phase=%s).", key.upper(), RUN_PHASE)
             return
+        if key == "p":
+            RL_PENDING_STEP_REWARD += PROGRESS_REWARD
+            logger_mp.info("[on_press] P: +%.1f on the current step.", PROGRESS_REWARD)
+            return
         RL_OUTCOME_REQUEST = "success" if key == "y" else "failure"
+        if key == "y":
+            RL_PENDING_STEP_REWARD += SUCCESS_REWARD
         logger_mp.info(
             "[on_press] %s: this chunk will end the episode as %s.",
             key.upper(), RL_OUTCOME_REQUEST,
@@ -275,6 +285,9 @@ def _run_rlt_job(adapter, remote, job, instruction):
         logger_mp.info("RL discard sent for %s", discard_id)
     spec = job.get("transition")
     if spec is not None:
+        step_observations = spec.get("step_observations") or []
+        for item in step_observations:
+            item["prompt"] = instruction
         remote.report_transition(
             spec["transition_id"],
             spec["next_frame"],
@@ -287,7 +300,10 @@ def _run_rlt_job(adapter, remote, job, instruction):
             intervention=spec["intervention"],
             episode_id=spec["episode_id"],
             chunk_id=spec["chunk_id"],
+            step_observations=step_observations,
         )
+        if spec["done"]:
+            remote.episode_end(success=spec.get("outcome") == "success", episode_id=spec["episode_id"])
         logger_mp.info(
             "RL transition sent id=%s done=%s intervention=%s reward_sum=%.1f",
             spec["transition_id"], spec["done"], spec["intervention"],
@@ -701,7 +717,10 @@ if __name__ == "__main__":
             executed = int(chunk.get("executed_steps", actions.shape[0]))
             executed = max(0, min(executed, int(actions.shape[0])))
             actions = actions[:executed]
-            fields = transition_fields(int(actions.shape[0]), outcome, intervention)
+            recorded = chunk.get("rewards")
+            if recorded is not None:
+                recorded = np.asarray(recorded, dtype=np.float32)[:executed]
+            fields = transition_fields(int(actions.shape[0]), outcome, intervention, recorded)
             return {
                 "rlt": True,
                 "transition": {
@@ -711,6 +730,8 @@ if __name__ == "__main__":
                     "action_chunk": actions,
                     "episode_id": chunk["episode_id"],
                     "chunk_id": chunk["chunk_id"],
+                    "outcome": outcome,
+                    "step_observations": list(chunk.get("step_observations") or []),
                     **fields,
                 },
             }
@@ -1202,7 +1223,17 @@ if __name__ == "__main__":
                     cmd_left_grip = step.left_grip
                     cmd_right_grip = step.right_grip
                     if args.rl_online:
-                        rollout.on_step()
+                        frame_now = state_now = None
+                        try:
+                            frame_now, state_now, _arm_now = _prepare_policy_request(
+                                adapter, img_client, arm_ctrl
+                            )
+                        except Exception as observe_error:
+                            logger_mp.debug("RL step observation skipped: %s", observe_error)
+                        rollout.on_step(frame_now, state_now)
+                        if RL_PENDING_STEP_REWARD:
+                            rollout.add_step_reward(RL_PENDING_STEP_REWARD)
+                            RL_PENDING_STEP_REWARD = 0.0
                         if rollout.chunk_finished() and not action_queue:
                             rl_report_due = True
                             chunk_just_finished = True

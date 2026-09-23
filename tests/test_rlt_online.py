@@ -82,9 +82,13 @@ class RLTOnlineTests(unittest.TestCase):
         rollout.accept_chunk("c", np.zeros((2, 16), dtype=np.float32), queue_len=2)
         self.assertFalse(rollout.chunk_finished())
         rollout.on_step()
+        rollout.add_step_reward(0.5)
         self.assertFalse(rollout.chunk_finished())
         rollout.on_step()
+        rollout.add_step_reward(1.0)
         self.assertTrue(rollout.chunk_finished())
+        chunk = rollout.take_open()
+        self.assertEqual(chunk["rewards"].tolist(), [0.5, 1.0])
 
     def test_takeover_commands_match_policy_layout(self):
         arm = np.arange(1, 15, dtype=np.float32)
@@ -99,7 +103,7 @@ class RLTOnlineTests(unittest.TestCase):
         physical = rewind_plan(frames=70, chunk_len=64, stored_chunks=3, include_current=True)
         self.assertEqual(physical["mode"], "exit")
         self.assertEqual(physical["chunks"], 2)
-        self.assertEqual(physical["terminal_reward"], -1.0)
+        self.assertEqual(physical["terminal_reward"], -0.2)
         credit = rewind_plan(frames=0, chunk_len=64, stored_chunks=2, include_current=False)
         self.assertEqual(credit["mode"], "credit")
         self.assertEqual(credit["chunks"], 1)

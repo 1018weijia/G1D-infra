@@ -22,6 +22,7 @@ from teleop.utils.rlt_online import (
     REQUEST_ACT,
     REQUEST_DISCARD,
     REQUEST_KEY,
+    REQUEST_EPISODE_END,
     REQUEST_REWIND_CREDIT,
     REQUEST_REWIND_EXIT,
     REQUEST_TRANSITION,
@@ -417,6 +418,7 @@ class PolicyRemoteClient:
         chunk_id: int = 0,
         session_id: str = "g1d",
         env_id: int = 0,
+        step_observations=None,
     ) -> dict:
         """Send the observation that follows an executed chunk."""
         rewards = np.asarray(rewards, dtype=np.float32).reshape(-1)
@@ -440,6 +442,8 @@ class PolicyRemoteClient:
                 "action_chunk_space": ACTION_SPACE_ROBOT,
                 "identity": identity,
             }
+            if step_observations:
+                payload["step_observations"] = step_observations
         else:
             payload = {
                 REQUEST_KEY: REQUEST_TRANSITION,
@@ -477,6 +481,15 @@ class PolicyRemoteClient:
             payload["bad_chunks"] = int(plan["chunks"])
         else:
             payload["chunks_rewound"] = int(plan["chunks"])
+        return self._exchange(payload)
+
+    def episode_end(self, *, success: bool, episode_id: int) -> dict:
+        """Ask the server to add sliding windows and run this episode's updates."""
+        payload = {
+            REQUEST_KEY: REQUEST_EPISODE_END,
+            "type": "rlt",
+            "stats": {"success": bool(success), "episode_id": int(episode_id)},
+        }
         return self._exchange(payload)
 
     def discard(self, transition_id: str) -> dict:

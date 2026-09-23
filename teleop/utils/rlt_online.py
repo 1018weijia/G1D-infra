@@ -16,10 +16,13 @@ REQUEST_TRANSITION = "transition"
 REQUEST_DISCARD = "discard"
 REQUEST_REWIND_EXIT = "rewind_exit_correction"
 REQUEST_REWIND_CREDIT = "rewind_credit_correction"
+REQUEST_EPISODE_END = "episode_end"
 ACTION_SPACE_ROBOT = "robot"
-# Same values the RLinf robot loop writes onto a rewound branch.
-REWIND_TERMINAL_REWARD = -1.0
+# remote-franka stage2.server.franka: rewind_physical_exit_reward / credit.
+REWIND_TERMINAL_REWARD = -0.2
 REWIND_PREFIX_REWARD = 0.1
+PROGRESS_REWARD = 0.5
+SUCCESS_REWARD = 1.0
 # Same reorder as PolicyAdapter: raw [L7, R7, LG, RG] -> [L7, LG, R7, RG].
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
 # Residual actor can push a gripper slightly past the SFT 5.5 safety cap.
@@ -28,16 +31,25 @@ RL_MAX_ABS_ARM_Q = 3.5
 RL_MAX_ABS_GRIPPER_Q = 6.5
 
 
-def transition_fields(num_actions: int, outcome: Optional[str], intervention: bool = False) -> dict:
+def transition_fields(
+    num_actions: int,
+    outcome: Optional[str],
+    intervention: bool = False,
+    rewards: Optional[np.ndarray] = None,
+) -> dict:
     """Reward and bootstrap flags for one executed chunk.
 
-    Success writes +1 on the last step and ends the episode. Failure ends
-    the episode with zeros. A rollback after some steps is an intervention:
-    reward stays 0 and the critic may still bootstrap.
+    A success or failure ends the episode and cuts bootstrap. When the caller
+    already stamped per-step scores, those values are kept. Otherwise a success
+    still writes +1 on the last step.
     """
     done = (not intervention) and outcome in ("success", "failure")
+    if rewards is None:
+        reward_row = chunk_rewards(num_actions, outcome if done else None)
+    else:
+        reward_row = np.asarray(rewards, dtype=np.float32).reshape(-1)[: int(num_actions)].copy()
     return {
-        "rewards": chunk_rewards(num_actions, outcome if done else None),
+        "rewards": reward_row,
         "done": done,
         "bootstrap_mask": 0.0 if done else 1.0,
         "intervention": bool(intervention),
@@ -113,12 +125,35 @@ class RLTRollout:
             "chunk_id": int(chunk_id),
             "queue_len": int(queue_len),
             "remaining": int(queue_len),
+            "rewards": np.zeros(int(queue_len), dtype=np.float32),
+            "step_observations": [],
         }
         return self.open
 
-    def on_step(self) -> None:
-        if self.open is not None and self.open["remaining"] > 0:
-            self.open["remaining"] -= 1
+    def on_step(self, frame_rgb=None, state=None) -> None:
+        if self.open is None or self.open["remaining"] <= 0:
+            return
+        self.open["remaining"] -= 1
+        if frame_rgb is not None and state is not None:
+            image = np.asarray(frame_rgb)
+            if image.dtype != np.uint8:
+                image = np.clip(image, 0, 255).astype(np.uint8)
+            self.open["step_observations"].append(
+                {
+                    "observation/image": np.ascontiguousarray(image),
+                    "observation/state": np.asarray(state, dtype=np.float32).reshape(-1).copy(),
+                    "prompt": "",
+                }
+            )
+
+    def add_step_reward(self, value: float) -> None:
+        """Add ``value`` onto the step that just ran."""
+        if self.open is None:
+            return
+        index = int(self.open["queue_len"]) - int(self.open["remaining"]) - 1
+        if index < 0 or index >= int(self.open["rewards"].shape[0]):
+            return
+        self.open["rewards"][index] += float(value)
 
     def chunk_finished(self) -> bool:
         return self.open is not None and self.open["remaining"] <= 0

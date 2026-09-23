@@ -83,7 +83,7 @@ INSTRUCTION="your task" \
 
 ## Stage 2 在线 RL
 
-`RL_ONLINE=1` 时，机器人不再做开环预取。每个动作块先 `act`，整段执行完再把下一次观测作为 `transition` 发回去，然后才请求下一块。默认的 `zmq` / `ws` 部署不受影响。
+开启步骤、端口和按键见 [GUIDE_STAGE2.md](GUIDE_STAGE2.md)。`RL_ONLINE=1` 时机器人不再做开环预取。每个动作块先 `act`，执行完把 `transition` 发回去，成功或失败后再发 `episode_end`。默认的 `zmq` / `ws` 部署不受影响。
 
 ```bash
 RL_ONLINE=1 \
@@ -100,13 +100,7 @@ INSTRUCTION="倒豆子" \
 ssh -N -R 127.0.0.1:16555:127.0.0.1:5555 unitree
 ```
 
-| 键 | 作用 |
-|---|---|
-| `S` | 开始一条新 episode，并发出第一块 `act` |
-| `Y` | 当前块执行完后记成功：最后一步奖励 1，`done=true`，回到 `POLICY_IDLE` |
-| `N` | 当前块执行完后记失败：奖励全 0，`done=true`，回到 `POLICY_IDLE` |
-| `B` | 物理回退，对应 RLinf 的 `rewind_exit`。已经走出的策略块先按原动作存下，再把回退覆盖到的末块最后一步奖励改成 -1，并切断 bootstrap。手臂没有可回放的历史时改发 `rewind_credit` |
-| `A` | 对齐后接管。接管期间的关节命令按块上报，`intervention=true`，行为克隆对准这些人工动作；再按一次 `A`（或 `S`）把控制交回策略 |
+按键、回退奖励和 `episode_end` 以 [GUIDE_STAGE2.md](GUIDE_STAGE2.md) 为准。`S` 开一条 episode，`P` 给当前拍 +0.5，`Y` / `N` 结束回合，`A` 接管，`B` 物理回退。
 
 动作仍是原始 AbsQpos，16 维 `[L7, LG, R7, RG]`，`action_chunk_space=robot`。不在机器人上做分位数归一化。上报的 `action_chunk` 是截断到实际执行长度之后、插值之前的模型动作。
 
