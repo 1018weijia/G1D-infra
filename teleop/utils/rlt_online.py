@@ -14,7 +14,12 @@ REQUEST_KEY = "rlt/request"
 REQUEST_ACT = "act"
 REQUEST_TRANSITION = "transition"
 REQUEST_DISCARD = "discard"
+REQUEST_REWIND_EXIT = "rewind_exit_correction"
+REQUEST_REWIND_CREDIT = "rewind_credit_correction"
 ACTION_SPACE_ROBOT = "robot"
+# Same values the RLinf robot loop writes onto a rewound branch.
+REWIND_TERMINAL_REWARD = -1.0
+REWIND_PREFIX_REWARD = 0.1
 # Same reorder as PolicyAdapter: raw [L7, R7, LG, RG] -> [L7, LG, R7, RG].
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
 # Residual actor can push a gripper slightly past the SFT 5.5 safety cap.
@@ -72,15 +77,20 @@ class RLTRollout:
     def __init__(self):
         self.episode_id = 0
         self.next_chunk_id = 0
+        self.stored_chunks = 0
         self.open: Optional[dict] = None
         self.outcome: Optional[str] = None
 
     def begin_episode(self) -> int:
         self.episode_id += 1
         self.next_chunk_id = 0
+        self.stored_chunks = 0
         self.open = None
         self.outcome = None
         return self.episode_id
+
+    def note_stored(self) -> None:
+        self.stored_chunks += 1
 
     def note_outcome(self, outcome: str) -> None:
         if outcome not in ("success", "failure"):
@@ -133,6 +143,33 @@ class RLTRollout:
         chunk["intervention"] = True
         chunk["executed_steps"] = executed
         return ("transition", chunk)
+
+
+def rewind_plan(frames: int, chunk_len: int, stored_chunks: int, include_current: bool) -> Optional[dict]:
+    """How a physical rollback maps onto RLinf's rewind correction.
+
+    A rollback that actually moves the arm is ``rewind_exit``. If the arm has
+    no history to replay but earlier chunks were stored, it falls back to
+    ``rewind_credit``, matching a transport that cannot rewind physically.
+    """
+    available = int(stored_chunks) + (1 if include_current else 0)
+    if available <= 0:
+        return None
+    chunk_len = max(1, int(chunk_len))
+    if int(frames) <= 0:
+        return {
+            "mode": "credit",
+            "chunks": 1,
+            "terminal_reward": REWIND_TERMINAL_REWARD,
+            "prefix_reward": REWIND_PREFIX_REWARD,
+        }
+    span = max(1, (int(frames) + chunk_len - 1) // chunk_len)
+    return {
+        "mode": "exit",
+        "chunks": min(span, available),
+        "terminal_reward": REWIND_TERMINAL_REWARD,
+        "prefix_reward": 0.0,
+    }
 
 
 def qpos_command(arm_q, left_grip: float, right_grip: float) -> np.ndarray:

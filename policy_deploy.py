@@ -42,6 +42,7 @@ from teleop.utils.rlt_online import (
     RLTRollout,
     TakeoverChunk,
     qpos_command,
+    rewind_plan,
     transition_fields,
 )
 from teleop.utils.policy_handoff import (
@@ -272,7 +273,6 @@ def _run_rlt_job(adapter, remote, job, instruction):
     if discard_id:
         remote.discard(discard_id)
         logger_mp.info("RL discard sent for %s", discard_id)
-        return {"kind": "discard"}
     spec = job.get("transition")
     if spec is not None:
         remote.report_transition(
@@ -293,6 +293,20 @@ def _run_rlt_job(adapter, remote, job, instruction):
             spec["transition_id"], spec["done"], spec["intervention"],
             float(np.sum(spec["rewards"])),
         )
+    rewind = job.get("rewind")
+    if rewind:
+        remote.rewind(
+            rewind,
+            episode_id=int(rewind.get("episode_id", 0)),
+            chunk_id=int(rewind.get("chunk_id", 0)),
+        )
+        logger_mp.info(
+            "RL rewind %s chunks=%d terminal=%.2f",
+            rewind.get("mode"), int(rewind.get("chunks", 0)),
+            float(rewind.get("terminal_reward", 0.0)),
+        )
+    if discard_id and spec is None and not job.get("act"):
+        return {"kind": "discard"}
     act = job.get("act")
     if act is None:
         # A finished episode has no next act. A takeover report doesn't either,
@@ -604,6 +618,8 @@ if __name__ == "__main__":
             try:
                 if isinstance(request, dict) and request.get("rlt"):
                     result = _run_rlt_job(adapter, remote, request, args.instruction)
+                    if request.get("transition") is not None and rollout is not None:
+                        rollout.note_stored()
                     discard_id = None
                     with inference_lock:
                         fresh = (
@@ -745,16 +761,18 @@ if __name__ == "__main__":
             return job
 
         def _commit_takeover(next_act):
+            if not takeover.active:
+                return False
+            if inference_busy():
+                logger_mp.error(
+                    "Takeover report is busy; chunk %s was not sent",
+                    takeover.transition_id,
+                )
+                return False
             closed = takeover.close()
             if closed is None:
                 return False
             identity, actions, _executed = closed
-            if inference_busy():
-                logger_mp.error(
-                    "Takeover report is busy; chunk %s was not sent",
-                    identity["transition_id"],
-                )
-                return False
             try:
                 job = _takeover_job(identity, actions, next_act)
             except Exception as error:
@@ -1002,44 +1020,62 @@ if __name__ == "__main__":
             if ROLLBACK_REQUEST and RUN_PHASE in ROLLBACK_FROM_PHASES:
                 ROLLBACK_REQUEST = False
                 rl_event = None
+                close_takeover = False
                 if args.rl_online and RUN_PHASE == POLICY_LIVE:
                     rl_report_due = False
                     rl_inflight = None
                     RL_OUTCOME_REQUEST = None
                     rl_event = rollout.interrupt()
                 elif args.rl_online and RUN_PHASE == TELEOP_LIVE:
+                    close_takeover = takeover.active
                     if takeover_gate["arming"]:
-                        takeover_gate["after"] = "discard"
+                        takeover_gate["arming"] = False
+                        takeover_gate["after"] = None
                         takeover_gate["rows"] = []
-                    elif takeover.active:
-                        _commit_takeover(None)
                 policy_inference_enabled = False
                 invalidate_inference()
                 action_queue.clear()
                 prefetched_queue.clear()
-                if rl_event is not None:
-                    kind, chunk = rl_event
+                if close_takeover:
+                    _commit_takeover(None)
+                raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
+                if args.rl_online and RUN_PHASE == POLICY_LIVE:
+                    kind, chunk = rl_event if rl_event is not None else (None, None)
+                    include_current = kind == "transition"
+                    plan = rewind_plan(
+                        len(raw_rollback),
+                        takeover_gate["chunk_len"],
+                        0 if rollout is None else rollout.stored_chunks,
+                        include_current,
+                    )
                     try:
+                        job = {"rlt": True}
                         if kind == "discard":
-                            job = {"rlt": True, "discard_id": chunk["transition_id"]}
-                        else:
+                            job["discard_id"] = chunk["transition_id"]
+                        elif kind == "transition":
                             frame, state, _arm_q = _prepare_policy_request(
                                 adapter, img_client, arm_ctrl
                             )
-                            job = _rlt_transition_job(chunk, frame, state, None, True)
-                        if start_inference(job):
-                            rl_inflight = job
-                        else:
-                            logger_mp.error(
-                                "Could not report interrupted RL chunk %s",
-                                chunk["transition_id"],
-                            )
+                            # The cut chunk is still the policy's actions. The
+                            # rewind correction, not an intervention flag, marks
+                            # it as the bad branch.
+                            job.update(_rlt_transition_job(chunk, frame, state, None, False))
+                        if plan is not None and rollout is not None:
+                            job["rewind"] = {
+                                **plan,
+                                "episode_id": rollout.episode_id,
+                                "chunk_id": rollout.next_chunk_id,
+                            }
+                        if job.keys() != {"rlt"}:
+                            if start_inference(job):
+                                rl_inflight = job
+                            else:
+                                logger_mp.error("Could not report the rollback to the RL server.")
                     except Exception as report_error:
                         logger_mp.error(
                             "Failed to report interrupted RL chunk: %s", report_error
                         )
                 reset_handoff_runtime(handoff)
-                raw_rollback = rollback_buffer.reverse_playback(exclude_latest=True)
                 ease_steps = max(2, int(round(ROLLBACK_EASE_SECONDS * args.frequency)))
                 rollback_sequence = ease_out_playback(raw_rollback, ease_steps)
                 RUN_PHASE = POLICY_ROLLBACK

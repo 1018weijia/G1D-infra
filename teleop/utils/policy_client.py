@@ -22,6 +22,8 @@ from teleop.utils.rlt_online import (
     REQUEST_ACT,
     REQUEST_DISCARD,
     REQUEST_KEY,
+    REQUEST_REWIND_CREDIT,
+    REQUEST_REWIND_EXIT,
     REQUEST_TRANSITION,
     RL_MAX_ABS_ARM_Q,
     RL_MAX_ABS_GRIPPER_Q,
@@ -454,6 +456,27 @@ class PolicyRemoteClient:
                 "action_chunk_space": ACTION_SPACE_ROBOT,
                 "identity": identity,
             }
+        return self._exchange(payload)
+
+    def rewind(self, plan: dict, *, episode_id: int = 0, chunk_id: int = 0) -> dict:
+        """Patch already stored chunks after a rollback.
+
+        ``exit`` is the physical rewind. ``credit`` only rewrites replay.
+        """
+        mode = str(plan.get("mode", "exit"))
+        request_name = REQUEST_REWIND_CREDIT if mode == "credit" else REQUEST_REWIND_EXIT
+        payload = {
+            REQUEST_KEY: request_name,
+            "terminal_reward": float(plan["terminal_reward"]),
+            "prefix_reward": float(plan.get("prefix_reward", 0.0)),
+            "preference_confidence": float(plan.get("preference_confidence", 1.0)),
+            "episode_id": int(episode_id),
+            "chunk_id": int(chunk_id),
+        }
+        if mode == "credit":
+            payload["bad_chunks"] = int(plan["chunks"])
+        else:
+            payload["chunks_rewound"] = int(plan["chunks"])
         return self._exchange(payload)
 
     def discard(self, transition_id: str) -> dict:
