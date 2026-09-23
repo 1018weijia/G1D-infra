@@ -543,7 +543,7 @@ if __name__ == "__main__":
         remote = PolicyRemoteClient(
             args.server_host,
             args.server_port,
-            timeout_ms=10000,
+            timeout_ms=180000 if args.rl_online else 10000,
             auto_connect=False,
             protocol=args.protocol,
         )
