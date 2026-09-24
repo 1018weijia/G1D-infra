@@ -16,15 +16,18 @@
 在 Motus 仓库：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 .venv/bin/python train/serve_rlt_online.py \
+CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python train/serve_rlt_online.py \
   --config configs/rlt_offline_pourbeans.yaml \
   --online-config configs/rlt_online_pourbeans.yaml \
   --actor-checkpoint outputs/rlt_offline_pourbeans/rlt_offline_pourbeans_0922_2129/actor.pt \
   --device cuda:0 \
+  --window-device cuda:1 \
   --t5-device cpu
 ```
 
-日志出现 `RLT online server listening on tcp://127.0.0.1:5555` 后再开隧道。服务只绑本机，不要改成 `0.0.0.0`。
+日志出现 `RLT online server listening on tcp://127.0.0.1:5555` 后再开隧道。服务只绑本机，不要改成 `0.0.0.0`。启动要加载两份 Motus，约 4–5 分钟。
+
+`--window-device` 在第二张卡上放一份冻结的 Motus，只在后台编码滑窗帧（每帧约 0.6 s）。`episode_end` 只做更新，几秒内返回，下一条可以马上开始。本回合的滑窗编码完后才入库（日志 `windows added=`），从下一回合的更新开始用上。不加这个参数时，滑窗在 `episode_end` 里同步编码，一条 10 块的轨迹要多等 1–2 分钟。
 
 前 20 条 chunk（滑窗不算）返回 Motus 参考动作，样本入库，不做梯度。满 20 条之后才走 EXPO actor。成功或失败按下之后，客户端发 `episode_end`，服务才按「本回合 actor 块数 × 5」做更新。
 
