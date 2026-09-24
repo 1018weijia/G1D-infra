@@ -58,11 +58,14 @@ from teleop.utils.policy_handoff import (
     A_HANDOFF_DEBOUNCE_S,
     A_TELEOP_READY_DEBOUNCE_S,
     ALIGNING,
+    CONTINUE_POLICY,
     DEBOUNCE_A,
     IGNORE_A,
     NONE,
+    PAUSE_SUCCESS,
     POLICY_IDLE,
     POLICY_LIVE,
+    POLICY_PAUSED,
     POLICY_ROLLBACK,
     QUIT,
     REPEAT_A,
@@ -107,23 +110,18 @@ KEY_LISTENER_STOP = threading.Event()
 RL_ONLINE = False
 RL_OUTCOME_REQUEST = None
 RL_PENDING_STEP_REWARD = 0.0
-RL_EPISODE_CLOSING = False
-RL_TAKEOVER_REQUEST = False
+# Set in POLICY_PAUSED: continue the policy, or close as "success"/"failure".
+PAUSE_CONTINUE = False
+PAUSE_OUTCOME = None
 
 
-def on_press(key):
+def on_press(key, source="keyboard"):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
     global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT, RL_OUTCOME_REQUEST
-    global RL_PENDING_STEP_REWARD, RL_EPISODE_CLOSING, RL_TAKEOVER_REQUEST
-    if RL_ONLINE and RL_EPISODE_CLOSING and key in ("s", "a"):
-        if key == "s":
-            START_POLICY = True
-            RL_TAKEOVER_REQUEST = False
-            logger_mp.info("[on_press] S queued: the next episode starts when this failure report finishes.")
-        else:
-            RL_TAKEOVER_REQUEST = True
-            START_POLICY = False
-            logger_mp.info("[on_press] A queued: hold this pose and align for takeover.")
+    global RL_PENDING_STEP_REWARD, PAUSE_CONTINUE, PAUSE_OUTCOME
+    if RL_ONLINE and RUN_PHASE == POLICY_PAUSED and key in ("y", "n"):
+        PAUSE_OUTCOME = "success" if key == "y" else "failure"
+        logger_mp.info("[on_press] %s: close this episode as %s.", key.upper(), PAUSE_OUTCOME)
         return
     if RL_ONLINE and key in ("y", "n", "p"):
         if RUN_PHASE != POLICY_LIVE:
@@ -143,13 +141,22 @@ def on_press(key):
         )
         return
     action, A_LAST_CHAR_AT = interpret_key(
-        key, RUN_PHASE, time.monotonic(), A_DEBOUNCE_UNTIL, A_LAST_CHAR_AT, A_GAP_S,
+        key, RUN_PHASE, time.monotonic(), A_DEBOUNCE_UNTIL, A_LAST_CHAR_AT, A_GAP_S, source,
     )
     if action == START_POLICY_ACTION:
         START_POLICY = True
     elif action == RESUME_POLICY_ACTION:
         RESUME_POLICY = True
-        logger_mp.info("[on_press] %s: return control to policy (phase=%s).", key.upper(), RUN_PHASE)
+        if RL_ONLINE:
+            logger_mp.info("[on_press] %s: takeover ends; pausing (phase=%s).", key.upper(), RUN_PHASE)
+        else:
+            logger_mp.info("[on_press] %s: return control to policy (phase=%s).", key.upper(), RUN_PHASE)
+    elif action == CONTINUE_POLICY:
+        PAUSE_CONTINUE = True
+        logger_mp.info("[on_press] A: continue the policy from this pose.")
+    elif action == PAUSE_SUCCESS:
+        PAUSE_OUTCOME = "success"
+        logger_mp.info("[on_press] S: close this episode as success.")
     elif action == QUIT:
         STOP = True
     elif action == ROLLBACK:
@@ -166,10 +173,15 @@ def on_press(key):
     elif action == DEBOUNCE_A:
         logger_mp.info("[on_press] A ignored until handoff settles.")
     elif action == IGNORE_A:
-        logger_mp.warning(
-            "[on_press] A ignored in %s. Press keyboard B to rollback, then gamepad A to take over.",
-            RUN_PHASE,
-        )
+        if RUN_PHASE == POLICY_PAUSED:
+            logger_mp.warning(
+                "[on_press] Gamepad A ignored while paused. In the terminal: A=continue, S or Y=success, N=failure."
+            )
+        else:
+            logger_mp.warning(
+                "[on_press] A ignored in %s. Press keyboard B to rollback, then gamepad A to take over.",
+                RUN_PHASE,
+            )
     elif action == REPEAT_A:
         return
     elif action == NONE:
@@ -739,6 +751,7 @@ if __name__ == "__main__":
         rl_deferred = []
         idle_discard_id = None
         upload_wait_log_time = 0.0
+        pause_hint_time = 0.0
         last_arm_q = hold_q.copy()
         last_tau = hold_tau.copy()
         last_left_grip = left_hold_grip
@@ -902,8 +915,8 @@ if __name__ == "__main__":
             arm_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
             _queue_teleop_chunk(_capture_observation(arm_q, *_read_grippers(arm_ctrl)))
 
-        def _hold_policy_pose(from_label):
-            """Stop following the hands now. The next act is requested when the worker is free."""
+        def _hold_policy_pose(from_label, phase=POLICY_LIVE):
+            """Stop following the hands now. In POLICY_LIVE the next act follows once the worker is free."""
             global RUN_PHASE, action_queue, policy_inference_enabled, recording
             global last_arm_q, last_tau, last_left_grip, last_right_grip
             resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
@@ -911,23 +924,75 @@ if __name__ == "__main__":
             arm_ik.reset_solution_state(resume_q)
             arm_ctrl.set_policy_gripper_q(resume_left, resume_right)
             action_queue = []
-            policy_inference_enabled = True
+            policy_inference_enabled = phase == POLICY_LIVE
             last_arm_q = resume_q.copy()
             last_tau = arm_ik.solve_tau(resume_q).copy()
             last_left_grip, last_right_grip = resume_left, resume_right
             clear_handoff_runtime()
-            RUN_PHASE = POLICY_LIVE
+            RUN_PHASE = phase
             recording = _start_record_episode(args, recorder, recording)
-            logger_mp.info(
-                "Policy holding the %s. The next chunk starts when the server is free.",
-                from_label,
-            )
+            if phase == POLICY_LIVE:
+                logger_mp.info(
+                    "Policy holding the %s. The next chunk starts when the server is free.",
+                    from_label,
+                )
 
         def _enter_policy_from_takeover():
-            """Leave teleop at once. Recorded human chunks upload before the next policy act."""
+            """End the takeover and hold this pose until the operator decides in the terminal."""
+            global A_DEBOUNCE_UNTIL, pause_hint_time
             _flush_teleop_chunk()
-            _hold_policy_pose("teleop pose")
+            _hold_policy_pose("teleop pose", POLICY_PAUSED)
+            A_DEBOUNCE_UNTIL = time.monotonic() + A_HANDOFF_DEBOUNCE_S
+            pause_hint_time = time.monotonic()
+            logger_mp.info(
+                "Takeover ended; paused (%d takeover reports uploading). Terminal: "
+                "A=continue policy, S or Y=success, N=failure.",
+                len(rl_deferred),
+            )
             return True
+
+        def _finish_episode(outcome, terminal_reward, reason):
+            """Close the episode on its last stored chunk and return to the ready pose.
+
+            The episode_end report queues behind any uploads still pending, so it
+            always closes the chunk that was stored last.
+            """
+            global RL_OUTCOME_REQUEST, RL_PENDING_STEP_REWARD, idle_discard_id
+            global policy_inference_enabled, START_POLICY, action_queue
+            global last_arm_q, last_tau, RUN_PHASE
+            job = {
+                "rlt": True,
+                "episode_end_only": True,
+                "success": outcome == "success",
+                "episode_id": rollout.episode_id,
+                "terminal_reward": float(terminal_reward),
+            }
+            if idle_discard_id:
+                job["discard_id"] = idle_discard_id
+            _send_or_defer(job)
+            RL_OUTCOME_REQUEST = None
+            RL_PENDING_STEP_REWARD = 0.0
+            idle_discard_id = None
+            policy_inference_enabled = False
+            START_POLICY = False
+            action_queue = []
+            logger_mp.info(
+                "Episode ends as %s (%s); returning to the ready pose (%d RL reports still uploading).",
+                outcome, reason, len(rl_deferred),
+            )
+            ready_result = move_to_ready_pose(
+                arm_ctrl,
+                arm_ik,
+                ready_pose_q,
+                args.ready_pose_seconds,
+                args.frequency,
+                grippers=(last_left_grip, last_right_grip),
+                stop_requested=lambda: STOP,
+            )
+            last_arm_q = ready_result.arm_q.copy()
+            last_tau = ready_result.tau.copy()
+            RUN_PHASE = POLICY_IDLE
+            logger_mp.info("Ready pose reached. Press S to start the next episode.")
 
         def try_resume_policy(from_label):
             global RUN_PHASE
@@ -985,8 +1050,10 @@ if __name__ == "__main__":
             START_POLICY = False
             logger_mp.info(
                 "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, Q=quit.%s",
-                " Y=success, N=failure." if args.rl_online else "",
+                "B=rollback, gamepad A=take over, gamepad A again (or S)=%s, Q=quit.%s",
+                "end takeover and pause" if args.rl_online else "return policy",
+                " Y=success, N=failure. While paused: terminal A=continue, S or Y=success, N=failure."
+                if args.rl_online else "",
             )
 
         while not STOP:
@@ -997,7 +1064,7 @@ if __name__ == "__main__":
 
             tele_data = tv_wrapper.get_tele_data()
             if gamepad_a.update(getattr(tele_data, "right_ctrl_aButton", False)):
-                on_press("a")
+                on_press("a", source="gamepad")
             aligned_left_pose = tele_data.left_wrist_pose_openxr
             aligned_right_pose = tele_data.right_wrist_pose_openxr
             if args.alignment_forward_offset:
@@ -1021,14 +1088,12 @@ if __name__ == "__main__":
                 _write_xr_grippers(
                     left_gripper_value, right_gripper_value, tele_data, args.input_mode
                 )
-            if args.rl_online and RL_EPISODE_CLOSING and START_POLICY:
-                _, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
-                    RUN_PHASE, False, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
-                )
-            else:
-                START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
-                    RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
-                )
+            START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
+                RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
+            )
+            if RUN_PHASE != POLICY_PAUSED:
+                PAUSE_CONTINUE = False
+                PAUSE_OUTCOME = None
 
             if args.rl_online and RUN_PHASE != POLICY_LIVE:
                 with inference_lock:
@@ -1040,7 +1105,6 @@ if __name__ == "__main__":
                 if outside_result is not None or outside_error is not None:
                     rl_inflight = None
                 if isinstance(outside_result, dict) and outside_result.get("kind") == "closed":
-                    RL_EPISODE_CLOSING = False
                     logger_mp.info("RL episode %d report finished.", rollout.episode_id)
                 elif isinstance(outside_result, dict) and outside_result.get("kind") == "act":
                     rl_deferred.append(
@@ -1052,29 +1116,28 @@ if __name__ == "__main__":
             if args.rl_online and rl_deferred and start_inference(rl_deferred[0]):
                 rl_deferred.pop(0)
 
-            if (args.rl_online and RL_TAKEOVER_REQUEST and not action_queue
-                    and RUN_PHASE == POLICY_LIVE):
-                RL_TAKEOVER_REQUEST = False
-                handoff["hold_q"] = np.asarray(last_arm_q, dtype=float).copy()
-                handoff["hold_tau"] = np.asarray(last_tau, dtype=float).copy()
-                handoff["hold_grip"] = np.array(
-                    [last_left_grip, last_right_grip], dtype=float
-                )
-                try:
-                    targets = rollback_endpoint_to_xr_targets(
-                        arm_ik, tv_wrapper, handoff["hold_q"], tele_data.head_pose,
-                        args.alignment_forward_offset,
-                    )
-                    alignment.reset(targets)
-                    tv_wrapper.set_alignment_targets(targets["left"], targets["right"])
-                except Exception as align_error:
-                    logger_mp.error("Could not enter takeover alignment: %s", align_error)
-                else:
-                    policy_inference_enabled = False
-                    RUN_PHASE = ALIGNING
+            if args.rl_online and RUN_PHASE == POLICY_PAUSED:
+                if PAUSE_OUTCOME is not None:
+                    outcome = PAUSE_OUTCOME
+                    PAUSE_OUTCOME = None
+                    PAUSE_CONTINUE = False
+                    reward = SUCCESS_REWARD if outcome == "success" else 0.0
+                    _finish_episode(outcome, reward, "paused after takeover")
+                    continue
+                if PAUSE_CONTINUE:
+                    PAUSE_CONTINUE = False
+                    policy_inference_enabled = True
+                    RUN_PHASE = POLICY_LIVE
                     logger_mp.info(
-                        "Holding this pose. Align the controllers and press A to take over. "
-                        "S starts another episode."
+                        "Policy continues from this pose (%d takeover reports upload first).",
+                        len(rl_deferred),
+                    )
+                elif time.monotonic() - pause_hint_time >= 10.0:
+                    pause_hint_time = time.monotonic()
+                    logger_mp.info(
+                        "Paused (%d takeover reports uploading). Terminal: A=continue policy, "
+                        "S or Y=success, N=failure.",
+                        len(rl_deferred),
                     )
 
             if START_POLICY and RUN_PHASE == POLICY_IDLE:
@@ -1297,7 +1360,6 @@ if __name__ == "__main__":
                     elif kind == "closed":
                         # Y/N already went to the ready pose. A queued episode_end
                         # can finish after the next episode started; it must not end that one.
-                        RL_EPISODE_CLOSING = False
                         logger_mp.info("Previous RL episode report finished.")
                 elif ready_queue is not None:
                     if action_queue:
@@ -1385,8 +1447,6 @@ if __name__ == "__main__":
                                     chunk = None
                                     if fields["done"]:
                                         policy_inference_enabled = False
-                                        RL_EPISODE_CLOSING = False
-                                        RL_TAKEOVER_REQUEST = False
                                         START_POLICY = False
                                         action_queue = []
                                         logger_mp.info(
@@ -1432,44 +1492,8 @@ if __name__ == "__main__":
                             # A policy act still on the wire would start a chunk
                             # the operator no longer wants; its reply is discarded.
                             invalidate_inference()
-                        outcome = RL_OUTCOME_REQUEST
-                        job = {
-                            "rlt": True,
-                            "episode_end_only": True,
-                            "success": outcome == "success",
-                            "episode_id": rollout.episode_id,
-                            "terminal_reward": float(RL_PENDING_STEP_REWARD),
-                        }
-                        if idle_discard_id:
-                            job["discard_id"] = idle_discard_id
-                        _send_or_defer(job)
-                        RL_OUTCOME_REQUEST = None
-                        RL_PENDING_STEP_REWARD = 0.0
-                        idle_discard_id = None
-                        policy_inference_enabled = False
-                        RL_EPISODE_CLOSING = False
-                        RL_TAKEOVER_REQUEST = False
-                        START_POLICY = False
-                        action_queue = []
-                        logger_mp.info(
-                            "No chunk is running. Ending as %s and returning to the ready pose "
-                            "(%d RL reports still uploading).",
-                            outcome, len(rl_deferred),
-                        )
-                        ready_result = move_to_ready_pose(
-                            arm_ctrl,
-                            arm_ik,
-                            ready_pose_q,
-                            args.ready_pose_seconds,
-                            args.frequency,
-                            grippers=(last_left_grip, last_right_grip),
-                            stop_requested=lambda: STOP,
-                        )
-                        last_arm_q = ready_result.arm_q.copy()
-                        last_tau = ready_result.tau.copy()
-                        RUN_PHASE = POLICY_IDLE
-                        logger_mp.info(
-                            "Ready pose reached. Press S to start the next episode."
+                        _finish_episode(
+                            RL_OUTCOME_REQUEST, float(RL_PENDING_STEP_REWARD), "no chunk was running",
                         )
                         continue
                     elif (policy_inference_enabled and rollout.open is None
@@ -1663,7 +1687,7 @@ if __name__ == "__main__":
                     )
                     logger_mp.info(
                         "Teleoperation handoff active. Only moving human commands are recorded for RL; "
-                        "holding still is not. Press gamepad A again to return control to policy."
+                        "holding still is not. Press gamepad A again to end the takeover."
                     )
                     teleop_gate.clear()
 

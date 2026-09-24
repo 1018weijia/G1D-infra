@@ -10,6 +10,9 @@ POLICY_LIVE = "POLICY_LIVE"
 POLICY_ROLLBACK = "POLICY_ROLLBACK"
 ALIGNING = "ALIGNING"
 TELEOP_LIVE = "TELEOP_LIVE"
+# After a takeover the arm holds while the operator decides: continue the
+# policy, or close the episode as a success or failure.
+POLICY_PAUSED = "POLICY_PAUSED"
 
 TELEOP_PHASES = (TELEOP_LIVE,)
 RESUME_FROM_PHASES = (ALIGNING,) + TELEOP_PHASES
@@ -27,6 +30,8 @@ TAKEOVER = "takeover"
 IGNORE_A = "ignore_a"
 DEBOUNCE_A = "debounce_a"
 REPEAT_A = "repeat_a"
+CONTINUE_POLICY = "continue_policy"
+PAUSE_SUCCESS = "pause_success"
 NONE = "none"
 
 ALIGNMENT_CODE = {"ALIGNING": 0, "ALIGNED": 1, "ACTIVE": 2}
@@ -97,17 +102,21 @@ def is_blending(handoff):
     return handoff.get("blend_started") is not None
 
 
-def interpret_key(key, phase, now, debounce_until, last_a_at, a_gap_s=A_GAP_S):
-    """Map one stdin character to a control intent.
+def interpret_key(key, phase, now, debounce_until, last_a_at, a_gap_s=A_GAP_S, source="keyboard"):
+    """Map one stdin character (or the gamepad A button) to a control intent.
 
     Returns (action, last_a_at). last_a_at is updated for every 'a', including
     ignored repeats, so a held key cannot both take over and immediately resume.
+    In POLICY_PAUSED only the terminal A continues, so a second gamepad press
+    cannot skip the pause.
     """
     if key == "s":
         if phase in TELEOP_PHASES:
             return RESUME_POLICY, last_a_at
         if phase in (POLICY_IDLE, ALIGNING):
             return START_POLICY, last_a_at
+        if phase == POLICY_PAUSED:
+            return PAUSE_SUCCESS, last_a_at
         return NONE, last_a_at
     if key == "q":
         return QUIT, last_a_at
@@ -122,6 +131,14 @@ def interpret_key(key, phase, now, debounce_until, last_a_at, a_gap_s=A_GAP_S):
     last_a_at = now
     if phase == ALIGNING:
         return TAKEOVER, last_a_at
+    if phase == POLICY_PAUSED:
+        if source != "keyboard":
+            return IGNORE_A, last_a_at
+        if now < debounce_until:
+            return DEBOUNCE_A, last_a_at
+        if gap < a_gap_s:
+            return REPEAT_A, last_a_at
+        return CONTINUE_POLICY, last_a_at
     if phase not in TELEOP_PHASES:
         return IGNORE_A, last_a_at
     if now < debounce_until:

@@ -8,12 +8,16 @@ from teleop.utils.handoff_utils import limit_joint_step, smoothstep_handoff_gain
 from teleop.utils.policy_client import PolicyAdapter, validate_action_chunk
 from teleop.utils.policy_handoff import (
     A_GAP_S,
+    A_HANDOFF_DEBOUNCE_S,
     ALIGNING,
+    CONTINUE_POLICY,
     DEBOUNCE_A,
     IGNORE_A,
     NONE,
+    PAUSE_SUCCESS,
     POLICY_IDLE,
     POLICY_LIVE,
+    POLICY_PAUSED,
     POLICY_ROLLBACK,
     REPEAT_A,
     RESUME_POLICY,
@@ -147,6 +151,30 @@ class PolicyHandoffKeyTests(unittest.TestCase):
             "a", TELEOP_LIVE, last_a + A_GAP_S, debounce_until, last_a
         )
         self.assertEqual(released, RESUME_POLICY)
+
+    def test_pause_after_takeover_waits_for_the_terminal(self):
+        ended, last_a = interpret_key("a", TELEOP_LIVE, 20.0, 0.0, 0.0, source="gamepad")
+        self.assertEqual(ended, RESUME_POLICY)
+        debounce_until = 20.0 + A_HANDOFF_DEBOUNCE_S
+        gamepad, last_a = interpret_key(
+            "a", POLICY_PAUSED, 21.0, debounce_until, last_a, source="gamepad",
+        )
+        self.assertEqual(gamepad, IGNORE_A)
+        early, last_a = interpret_key("a", POLICY_PAUSED, 20.2, debounce_until, 0.0)
+        self.assertEqual(early, DEBOUNCE_A)
+        cont, last_a = interpret_key("a", POLICY_PAUSED, 22.0, debounce_until, 0.0)
+        self.assertEqual(cont, CONTINUE_POLICY)
+        repeat, _ = interpret_key("a", POLICY_PAUSED, 22.1, debounce_until, last_a)
+        self.assertEqual(repeat, REPEAT_A)
+        self.assertEqual(interpret_key("s", POLICY_PAUSED, 22.0, 0.0, 0.0)[0], PAUSE_SUCCESS)
+        self.assertEqual(interpret_key("b", POLICY_PAUSED, 22.0, 0.0, 0.0)[0], NONE)
+
+    def test_pause_keys_are_dropped_outside_the_pause(self):
+        self.assertEqual(interpret_key("s", POLICY_LIVE, 1.0, 0.0, 0.0)[0], NONE)
+        self.assertEqual(interpret_key("a", POLICY_LIVE, 1.0, 0.0, 0.0)[0], IGNORE_A)
+        start, resume, _, _ = stale_key_flags(POLICY_PAUSED, True, True, False, False)
+        self.assertFalse(start)
+        self.assertFalse(resume)
 
     def test_a_ignored_until_rollback(self):
         self.assertEqual(interpret_key("a", POLICY_LIVE, 1.0, 0.0, 0.0)[0], IGNORE_A)
