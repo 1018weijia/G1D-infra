@@ -1295,14 +1295,10 @@ if __name__ == "__main__":
                                 ready_queue["transition_id"], len(action_queue),
                             )
                     elif kind == "closed":
+                        # Y/N already went to the ready pose. A queued episode_end
+                        # can finish after the next episode started; it must not end that one.
                         RL_EPISODE_CLOSING = False
-                        if RUN_PHASE == POLICY_LIVE:
-                            policy_inference_enabled = False
-                            RUN_PHASE = POLICY_IDLE
-                            logger_mp.info(
-                                "RL episode %d ended. Press S to start another.",
-                                rollout.episode_id,
-                            )
+                        logger_mp.info("Previous RL episode report finished.")
                 elif ready_queue is not None:
                     if action_queue:
                         action_queue.extend(ready_queue)
