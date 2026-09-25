@@ -17,13 +17,15 @@
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python train/serve_rlt_online.py \
-  --config configs/rlt_offline_pourbeans.yaml \
+  --config configs/rlt_offline_pourbeans_local.yaml \
   --online-config configs/rlt_online_pourbeans.yaml \
   --actor-checkpoint outputs/rlt_offline_pourbeans/rlt_offline_pourbeans_0922_2129/actor.pt \
   --device cuda:0 \
   --window-device cuda:1 \
   --t5-device cpu
 ```
+
+`rlt_offline_pourbeans_local.yaml` 把 `/mnt/data`（ossfs 挂载，会断）上的依赖换成本地副本：Motus 用 `/root/lfwj/ewam-RL/ckpt/ewam_pour_beans`（已核对与 Stage 1 / 离线 buffer 所用权重一致：重算 `z_rl` 与 buffer 余弦 1.0），WAN/VAE/Qwen3-VL 用 `ckpt/pretrained_models`，T5 缓存用 `ckpt/t5_cache/g1d_pour_beans_eps380`。
 
 日志出现 `RLT online server listening on tcp://127.0.0.1:5555` 后再开隧道。服务只绑本机，不要改成 `0.0.0.0`。启动要加载两份 Motus，约 4–5 分钟。
 
