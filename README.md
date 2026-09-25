@@ -53,3 +53,19 @@ git submodule update --init --recursive
 - [GUIDE_DEPLOY.md](GUIDE_DEPLOY.md) policy 回退与对齐接管
 - [GUIDE_REPLAY.md](GUIDE_REPLAY.md) 轨迹开环重放
 - [TESTING.md](TESTING.md) 验收测试（L0–L3 无需硬件，L4–L5 上机）
+
+## G1-D deployment compatibility extension
+
+The local sys01 fork includes `integrations/g1d_infra_compat/`. It adapts the
+Pico rising-edge controls used by this repository (right A start/pause/resume,
+left Y record, left X mark the current episode failed, right B quit) to the
+existing JSONL/XR bridge. It also provides an asynchronous optional voice
+announcer and retains the rollback/alignment handoff helpers and deploy entry
+point used by this repository. The extension is opt-in and does not change the
+default collector or policy deploy behavior.
+
+Run its hardware-free checks with:
+
+```bash
+python -m unittest -v tests/test_g1d_infra_compat.py
+```
