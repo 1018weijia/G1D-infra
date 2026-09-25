@@ -752,6 +752,7 @@ if __name__ == "__main__":
         idle_discard_id = None
         upload_wait_log_time = 0.0
         pause_hint_time = 0.0
+        idle_hint_time = time.monotonic()
         last_arm_q = hold_q.copy()
         last_tau = hold_tau.copy()
         last_left_grip = left_hold_grip
@@ -959,7 +960,7 @@ if __name__ == "__main__":
             """
             global RL_OUTCOME_REQUEST, RL_PENDING_STEP_REWARD, idle_discard_id
             global policy_inference_enabled, START_POLICY, action_queue
-            global last_arm_q, last_tau, RUN_PHASE
+            global last_arm_q, last_tau, RUN_PHASE, idle_hint_time
             job = {
                 "rlt": True,
                 "episode_end_only": True,
@@ -992,6 +993,7 @@ if __name__ == "__main__":
             last_arm_q = ready_result.arm_q.copy()
             last_tau = ready_result.tau.copy()
             RUN_PHASE = POLICY_IDLE
+            idle_hint_time = time.monotonic()
             logger_mp.info("Ready pose reached. Press S to start the next episode.")
 
         def try_resume_policy(from_label):
@@ -1105,7 +1107,14 @@ if __name__ == "__main__":
                 if outside_result is not None or outside_error is not None:
                     rl_inflight = None
                 if isinstance(outside_result, dict) and outside_result.get("kind") == "closed":
-                    logger_mp.info("RL episode %d report finished.", rollout.episode_id)
+                    if RUN_PHASE == POLICY_IDLE:
+                        idle_hint_time = time.monotonic()
+                        logger_mp.info(
+                            "RL episode %d report finished. Ready pose held: press S to start the next episode.",
+                            rollout.episode_id,
+                        )
+                    else:
+                        logger_mp.info("RL episode %d report finished.", rollout.episode_id)
                 elif isinstance(outside_result, dict) and outside_result.get("kind") == "act":
                     rl_deferred.append(
                         {"rlt": True, "discard_id": outside_result["transition_id"]}
@@ -1115,6 +1124,15 @@ if __name__ == "__main__":
 
             if args.rl_online and rl_deferred and start_inference(rl_deferred[0]):
                 rl_deferred.pop(0)
+
+            # Upload logs can scroll the ready prompt away; repeat it while waiting.
+            if (args.rl_online and RUN_PHASE == POLICY_IDLE
+                    and time.monotonic() - idle_hint_time >= 30.0):
+                idle_hint_time = time.monotonic()
+                logger_mp.info(
+                    "Ready pose held: press S to start the next episode (%d RL reports uploading).",
+                    len(rl_deferred),
+                )
 
             if args.rl_online and RUN_PHASE == POLICY_PAUSED:
                 if PAUSE_OUTCOME is not None:
@@ -1464,6 +1482,7 @@ if __name__ == "__main__":
                                         last_arm_q = ready_result.arm_q.copy()
                                         last_tau = ready_result.tau.copy()
                                         RUN_PHASE = POLICY_IDLE
+                                        idle_hint_time = time.monotonic()
                                         logger_mp.info(
                                             "Ready pose reached. Press S to start the next episode."
                                         )
