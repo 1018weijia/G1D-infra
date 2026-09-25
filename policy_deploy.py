@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import logging_mp
 import os
+import signal
 import sys
 import termios
 import threading
@@ -251,6 +252,25 @@ def _stdin_key_loop(on_press_cb, stop_event):
             termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         except Exception:
             pass
+
+
+def _ease_to_home(arm_ctrl, arm_ik, seconds, frequency):
+    """Glide both arms to the zero home pose on exit instead of snapping there.
+
+    ``ctrl_dual_arm_go_home`` jumps the target to zero and the controller only
+    limits joint speed to 30 rad/s, so the arms slam home in ~0.2 s. The eased
+    profile gets there first; go_home then only confirms the pose.
+    """
+    if arm_ik is not None:
+        logger_mp.info(
+            "Easing both arms to home over %.1fs; Ctrl+C is ignored until done (Ctrl+\\ forces exit).",
+            seconds,
+        )
+        move_to_ready_pose(
+            arm_ctrl, arm_ik, np.zeros(14), seconds, frequency,
+            grippers=_read_grippers(arm_ctrl), settle_seconds=0.5,
+        )
+    arm_ctrl.ctrl_dual_arm_go_home()
 
 
 def _read_grippers(arm_ctrl):
@@ -608,6 +628,10 @@ if __name__ == "__main__":
         "--ready-pose-seconds", type=float, default=3.0,
         help="seconds to move from the current pose to the raised startup pose",
     )
+    parser.add_argument(
+        "--home-seconds", type=float, default=4.0,
+        help="seconds to glide both arms to the zero home pose on exit (Ctrl+C)",
+    )
     parser.add_argument("--swap-wrists", action="store_true", default=True)
     parser.add_argument("--no-swap-wrists", action="store_false", dest="swap_wrists")
     parser.add_argument(
@@ -646,6 +670,8 @@ if __name__ == "__main__":
         parser.error("--frequency must be positive")
     if args.ready_pose_seconds <= 0.0:
         parser.error("--ready-pose-seconds must be positive")
+    if args.home_seconds <= 0.0:
+        parser.error("--home-seconds must be positive")
     try:
         ready_pose_q = load_ready_pose(args.ready_pose_config)
     except ReadyPoseError as error:
@@ -676,6 +702,7 @@ if __name__ == "__main__":
     remote = None
     tv_wrapper = None
     arm_ctrl = None
+    arm_ik = None
     recorder = None
     recording = False
     inference_thread = None
@@ -1865,11 +1892,15 @@ if __name__ == "__main__":
             remote.close()
         if worker is not None:
             worker.join(timeout=2.0)
+        # A second Ctrl+C must not cut the glide short and leave the arms mid-way.
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             if arm_ctrl is not None:
-                arm_ctrl.ctrl_dual_arm_go_home()
+                _ease_to_home(arm_ctrl, arm_ik, args.home_seconds, args.frequency)
         except Exception as home_error:
             logger_mp.error("Failed to go home: %s", home_error)
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
         try:
             KEY_LISTENER_STOP.set()
             listen_keyboard_thread.join(timeout=1.0)
