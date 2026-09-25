@@ -28,6 +28,12 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python train/serve_rlt_online.py \
 
 `rlt_offline_pourbeans_local.yaml` 把 `/mnt/data`（ossfs 挂载，会断）上的依赖换成本地副本：Motus 用 `/root/lfwj/ewam-RL/ckpt/ewam_pour_beans`（已核对与 Stage 1 / 离线 buffer 所用权重一致：重算 `z_rl` 与 buffer 余弦 1.0），WAN/VAE/Qwen3-VL 用 `ckpt/pretrained_models`，T5 缓存用 `ckpt/t5_cache/g1d_pour_beans_eps380`。
 
+每次 `episode_end` 之后，服务端把完整在线状态（actor/critic、target、BC actor、优化器、replay、intervention、偏好 buffer、计数器）存到 `outputs/rlt_online_pourbeans/online_state.pt`。重启时加 `--resume outputs/rlt_online_pourbeans/online_state.pt` 接着训，warmup 不用重攒（对应 Franka 的 `resume_checkpoint`）。先把这个文件复制一份再重启，防止新进程第一次保存时覆盖。
+
+和 Franka 对齐的几处：EXPO 的 4 个 base 是 4 条独立采样的 Motus 参考（一次批量推理），TD 备份在下一状态也用 4 条独立参考；transition 的下一帧和紧接着的 `act` 是同一帧，服务端缓存这次编码，所以每个块边界仍只算一次（约 3 s）。`act` 日志里的 `ref_spread` 是 4 条参考之间的最大差，`edit` 是执行动作相对所选参考的最大改动。
+
+额外加的（Franka 没有）：`success_bc_beta: 1.0`。按 Y 成功的回合，其策略块、接管块和滑窗都标成成功样本，离线演示也算成功样本；actor 更新时对这些样本加 BC 项，把输出拉向实际执行的动作，损失除以 `edit_scale^2`。
+
 日志出现 `RLT online server listening on tcp://127.0.0.1:5555` 后再开隧道。服务只绑本机，不要改成 `0.0.0.0`。启动要加载两份 Motus，约 4–5 分钟。
 
 `--window-device` 在第二张卡上放一份冻结的 Motus，只在后台编码滑窗帧（每帧约 0.6 s）。`episode_end` 只做更新，几秒内返回，下一条可以马上开始。本回合的滑窗编码完后才入库（日志 `windows added=`），从下一回合的更新开始用上。不加这个参数时，滑窗在 `episode_end` 里同步编码，一条 10 块的轨迹要多等 1–2 分钟。
@@ -79,7 +85,7 @@ INSTRUCTION="把方口杯里的红豆，倒进灰色的粗口杯里，倒半杯"
 | `Q` | 信用截断：机器人不动、不停、不对齐，只把块标成坏块。第一次按标“按下时正在执行的块”（没有在执行的就标最近存下的那块），每多按一次再往前多标一块。坏块最后一步 -0.2 并切断 bootstrap，坏块之前那一块末步 +0.1 作为恢复起点（`rewind_credit`）。按 `B` 物理回退时，未发出的 `Q` 标记作废（Franka 不混用两者） |
 | `Y` | 成功 +1。正在执行的块发回后成功收束。当前没有在执行的块时立刻收束，不再执行下一块。然后手臂回到准备姿势。再按 `S` 开下一条 |
 | `N` | 失败（奖励 0）。正在执行的块发回后失败收束；当前没有在执行的块时立刻收束。然后手臂回到准备姿势。再按 `S` 开下一条 |
-| `A` | 对齐完成后接管。人工关节记成 `intervention=true`。接管段在本地按 64 个计入步连续切块，不等服务端，一步不丢；块边界和每 4 步的观测在本地拍下，排队上传，服务端据此在接管段也切滑窗。对齐等待、交接过渡和接管后原地不动的拍都不记；和 Franka 的死区一样，任一只手末端动 1.5 mm、转 0.01 rad、关节变 0.02 rad 或夹爪明显变化才算一步，接管块的观测也在第一次真正动的时候拍。接管中再按手柄 `A`（或终端 `A`/`S`）结束接管并**暂停**：手臂停在当前姿势，没满 64 步的最后一块也照常上传 |
+| `A` | 对齐完成后接管。人工关节记成 `intervention=true`。接管段在本地按 64 个计入步连续切块，不等服务端，一步不丢；块边界和每 4 步的观测在本地拍下，排队上传，服务端据此在接管段也切滑窗。对齐等待、交接过渡和接管后原地不动的拍都不记；和 Franka 的死区一样，任一只手末端动 1.5 mm、转 0.01 rad、关节变 0.02 rad 或夹爪明显变化才算一步，接管块的观测也在第一次真正动的时候拍。接管动作的标签和 Franka `gello_measured_action_labels` 一样：每一步记的是下一计入步开始时实测到达的关节角（块末一步在切块时读），夹爪记指令值。接管中再按手柄 `A`（或终端 `A`/`S`）结束接管并**暂停**：手臂停在当前姿势，没满 64 步的最后一块也照常上传 |
 | `B` | 物理回退一块。只倒放这一块已经走出的关节指令；当前块还没动时，倒放上一整块。学习侧只把这一块标成坏分支，最后一步奖励 -0.2，切断 bootstrap。没有可回放的历史时发 `rewind_credit`，并给前一段末步 +0.1 |
 | `Ctrl+C` | 退出：双臂用 4 s 平滑插值回到零位（`--home-seconds` 可调），夹爪保持不动，期间再按 Ctrl+C 会被忽略，避免停在半路；实在要强制退出用 Ctrl+\。`Q` 已改为信用截断，和 Franka 一致 |
 

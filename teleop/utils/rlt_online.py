@@ -541,6 +541,18 @@ class TeleopChunker:
         self._chunk["step_observations"].append(step_obs)
         return self.full
 
+    def relabel_last(self, measured_arm_q) -> None:
+        """remote-franka ``gello_measured_action_labels``: the previous step's arm
+        label becomes the pose it actually reached, read when the next counted
+        step starts (or at the chunk boundary). The gripper keeps the command.
+        """
+        if self._chunk is None or not self._chunk["actions"]:
+            return
+        arm = np.asarray(measured_arm_q, dtype=np.float32).reshape(-1)[:14]
+        row = self._chunk["actions"][-1]
+        row[0:7] = arm[0:7]
+        row[8:15] = arm[7:14]
+
     def close(self, next_obs) -> Optional[dict]:
         """Finish the chunk. Returns None when it has no steps."""
         chunk, self._chunk = self._chunk, None

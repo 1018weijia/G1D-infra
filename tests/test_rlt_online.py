@@ -228,6 +228,23 @@ class RLTOnlineTests(unittest.TestCase):
         self.assertEqual(credit["prefix_reward"], 0.1)
         self.assertIsNone(rewind_plan(0, 64, 0, False))
 
+    def test_takeover_steps_are_labelled_with_the_measured_pose(self):
+        chunker = TeleopChunker(chunk_len=4)
+        chunker.relabel_last(np.ones(14))
+        chunker.open({"obs": "o0"}, episode_id=1, chunk_id=0)
+        chunker.relabel_last(np.ones(14))
+        commanded = qpos_command(np.full(14, 0.5), 2.0, 3.0)
+        chunker.push(commanded)
+        measured = np.arange(14, dtype=np.float32) / 10.0
+        chunker.relabel_last(measured)
+        done = chunker.close({"obs": "o1"})
+        row = done["actions"][0]
+        self.assertTrue(np.allclose(row[0:7], measured[0:7]))
+        self.assertTrue(np.allclose(row[8:15], measured[7:14]))
+        self.assertAlmostEqual(float(row[7]), 2.0)
+        self.assertAlmostEqual(float(row[15]), 3.0)
+        self.assertAlmostEqual(float(commanded[0]), 0.5)
+
     def test_teleop_chunks_chain_their_boundary_observations(self):
         chunker = TeleopChunker(chunk_len=2)
         self.assertIsNone(chunker.close(None))

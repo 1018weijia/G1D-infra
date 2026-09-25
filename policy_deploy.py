@@ -967,6 +967,7 @@ if __name__ == "__main__":
             if not teleop_chunker.active:
                 return
             arm_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
+            teleop_chunker.relabel_last(arm_q)
             _queue_teleop_chunk(_capture_observation(arm_q, *_read_grippers(arm_ctrl)))
 
         def _hold_policy_pose(from_label, phase=POLICY_LIVE):
@@ -1828,6 +1829,8 @@ if __name__ == "__main__":
                             teleop_gate.reset(command, left_pose, right_pose)
                         elif teleop_gate.should_count(command, left_pose, right_pose):
                             grips = (tele_left_grip, tele_right_grip)
+                            # Measured now = where the previous counted command got the arm.
+                            teleop_chunker.relabel_last(current_lr_arm_q)
                             if teleop_chunker.full or not teleop_chunker.active:
                                 # This observation ends the previous chunk and
                                 # starts the next, taken at the first real move.
