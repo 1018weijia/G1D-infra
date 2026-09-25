@@ -7,7 +7,7 @@
 - 机器人是 G1D，控制仍是这套 DDS、对齐和 30 Hz 执行。
 - 动作是 16 维原始 AbsQpos，`[L7, LG, R7, RG]`，chunk 长度 64。
 - 裁剪用倒豆子 checkpoint 里的值（clip 约 `[-2.164, 6.031]`），不改成 Franka 的末端位姿尺度。
-- 残差上限按关节设（`edit_scale_per_joint`，对应 Franka 同名字段，写在 `rlt_online_pourbeans.yaml`），顺序 `[L7, LG, R7, RG]`，每维取接管数据里 |人工动作 − Motus 参考| 的中位数，最低 0.05 rad。统一的 0.05（约 2.9°）太紧：离线 actor 的 tanh 是饱和的，改动每块都顶在 0.05，而人工修正平均 0.148 rad、61% 的步超过 0.05，且越往块尾差距越大（第 0 步 0.033，第 63 步 0.203）。参考每块重新锚定，偏移不会累积，所以手臂会停在“参考 + 0.05”到不了位。checkpoint 里的 0.2 又太大，一执行就失败。`edit_scale` 0.05 仍是没有按关节上限时的回退值。`actor_noise_sigma=0.03` 加在 tanh 之前，对幅度基本没有影响。
+- 残差上限 `edit_scale` 现在所有维统一 0.07 rad（约 4°，写在 `rlt_online_pourbeans.yaml`），是在机器人上试出来的。试过按关节设（`edit_scale_per_joint`，对应 Franka 同名字段，顺序 `[L7, LG, R7, RG]`，取接管数据里 |人工动作 − Motus 参考| 的中位数，最低 0.05，最大到 0.174），实际动作幅度太大；该字段留空时就用统一值。统一的 0.05（约 2.9°）又太紧：离线 actor 的 tanh 是饱和的，改动每块都顶在 0.05，而人工修正平均 0.148 rad、61% 的步超过 0.05，且越往块尾差距越大（第 0 步 0.033，第 63 步 0.203）。参考每块重新锚定，偏移不会累积，所以手臂会停在“参考 + 0.05”到不了位。checkpoint 里的 0.2 更大，一执行就失败。`actor_noise_sigma=0.03` 加在 tanh 之前，对幅度基本没有影响。
 
 不要占用 `15555`。那是另一台 GPU 部署策略的本地口。在线训练走机器人本机 `127.0.0.1:16556`。
 
@@ -29,7 +29,7 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python train/serve_rlt_online.py \
 
 每次 `episode_end` 之后，服务端把完整在线状态（actor/critic、target、BC actor、优化器、replay、intervention、偏好 buffer、计数器）存到 `outputs/rlt_online_pourbeans/online_state.pt`。重启时加 `--resume outputs/rlt_online_pourbeans/online_state.pt` 接着训，warmup 不用重攒（对应 Franka 的 `resume_checkpoint`）。先把这个文件复制一份再重启，防止新进程第一次保存时覆盖。
 
-和 Franka 对齐的几处：EXPO 的 4 个 base 是 4 条独立采样的 Motus 参考（一次批量推理），TD 备份在下一状态也用 4 条独立参考；transition 的下一帧和紧接着的 `act` 是同一帧，服务端缓存这次编码，所以每个块边界仍只算一次（约 3 s）。`act` 日志里的 `ref_spread` 是 4 条参考之间的最大差，`edit` 是执行动作相对所选参考的最大改动（按关节上限后最大可到 0.174）。
+和 Franka 对齐的几处：EXPO 的 4 个 base 是 4 条独立采样的 Motus 参考（一次批量推理），TD 备份在下一状态也用 4 条独立参考；transition 的下一帧和紧接着的 `act` 是同一帧，服务端缓存这次编码，所以每个块边界仍只算一次（约 3 s）。`act` 日志里的 `ref_spread` 是 4 条参考之间的最大差，`edit` 是执行动作相对所选参考的最大改动（最大就是上限 0.07）。
 
 服务端在滑窗写进 buffer 之后也会再存一次，重启不会丢最后一条轨迹的滑窗。
 
