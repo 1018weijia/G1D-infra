@@ -6,7 +6,8 @@
 
 - 机器人是 G1D，控制仍是这套 DDS、对齐和 30 Hz 执行。
 - 动作是 16 维原始 AbsQpos，`[L7, LG, R7, RG]`，chunk 长度 64。
-- 裁剪和残差幅度用倒豆子 checkpoint 里的值（clip 约 `[-2.164, 6.031]`，`edit_scale=0.2`），不改成 Franka 的末端位姿尺度。
+- 裁剪用倒豆子 checkpoint 里的值（clip 约 `[-2.164, 6.031]`），不改成 Franka 的末端位姿尺度。
+- 残差上限 `edit_scale` 在线用 0.05 rad（约 2.9°，写在 `rlt_online_pourbeans.yaml`），不用 checkpoint 里的 0.2：离线 actor 把 tanh 推到饱和，0.2 时平均改动约 6°、每块都顶到 11.5°，一执行就失败；演示动作与 Motus 参考的差距中位数只有 0.014 rad，0.05 仍覆盖其中 75%。`actor_noise_sigma=0.03` 加在 tanh 之前，乘上上限后约 0.1°，对幅度基本没有影响。
 - Motus 每次给出一条参考动作。EXPO 的 4 个 base 槽位都是这一条；另外 4 个是 actor 残差，4 个是 BC actor。
 
 不要占用 `15555`。那是另一台 GPU 部署策略的本地口。在线训练走机器人本机 `127.0.0.1:16556`。
