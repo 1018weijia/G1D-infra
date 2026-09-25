@@ -22,6 +22,24 @@ class PolicyRollbackBuffer:
             float(right_grip),
         ))
 
+    def append_if_moved(self, arm_q, tau, left_grip, right_grip, min_delta=1e-4, grip_delta=1e-3):
+        """Record a teleop command only when it differs from the last one.
+
+        Holding still would otherwise fill the history with one pose, and a
+        rollback right after a pause would replay nothing.
+        """
+        if self._items:
+            last_q, _, last_left, last_right = self._items[-1]
+            still = (
+                float(np.max(np.abs(np.asarray(arm_q, dtype=float) - last_q))) < min_delta
+                and abs(float(left_grip) - last_left) < grip_delta
+                and abs(float(right_grip) - last_right) < grip_delta
+            )
+            if still:
+                return False
+        self.append(arm_q, tau, left_grip, right_grip)
+        return True
+
     def clear(self):
         self._items.clear()
 

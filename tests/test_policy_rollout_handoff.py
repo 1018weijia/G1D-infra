@@ -97,6 +97,16 @@ class PolicyRolloutHandoffTests(unittest.TestCase):
         self.assertEqual(playback[0][2], 3.0)
         self.assertEqual(len(buffer), 0)
 
+    def test_holding_still_does_not_fill_the_rollback_history(self):
+        buffer = PolicyRollbackBuffer(seconds=1.0, frequency=10.0)
+        for idx in range(4):
+            self.assertTrue(buffer.append_if_moved(np.full(14, 0.1 * idx), np.zeros(14), 5.0, 5.0))
+        for _ in range(30):
+            self.assertFalse(buffer.append_if_moved(np.full(14, 0.3), np.zeros(14), 5.0, 5.0))
+        self.assertTrue(buffer.append_if_moved(np.full(14, 0.3), np.zeros(14), 4.0, 5.0))
+        playback = buffer.reverse_playback(exclude_latest=True)
+        self.assertEqual([round(frame[0][0], 2) for frame in playback], [0.3, 0.2, 0.1, 0.0])
+
     def test_ease_out_stops_on_the_recorded_endpoint(self):
         frames = []
         for idx in range(30):

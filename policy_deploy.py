@@ -1403,6 +1403,7 @@ if __name__ == "__main__":
             cmd_left_grip = last_left_grip
             cmd_right_grip = last_right_grip
             teleop_stepped = False
+            policy_stepped = False
 
             if RUN_PHASE == POLICY_LIVE:
                 try:
@@ -1482,6 +1483,7 @@ if __name__ == "__main__":
                 step = action_queue.pop(0) if action_queue else None
                 chunk_just_finished = False
                 if step is not None:
+                    policy_stepped = True
                     sol_q = step.arm_q
                     sol_tauff = arm_ik.solve_tau(sol_q)
                     cmd_left_grip = step.left_grip
@@ -1812,14 +1814,18 @@ if __name__ == "__main__":
                     )
                     teleop_gate.clear()
 
+            # Only real motion goes into the rollback history: waiting between
+            # chunks or holding still in teleop would otherwise make B replay
+            # a frozen pose.
             if RUN_PHASE == POLICY_LIVE:
-                rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
+                if policy_stepped:
+                    rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
             elif RUN_PHASE == TELEOP_LIVE:
                 if blending:
-                    rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
+                    rollback_buffer.append_if_moved(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
                 else:
                     tele_left_grip, tele_right_grip = _read_grippers(arm_ctrl)
-                    rollback_buffer.append(sol_q[:14], sol_tauff[:14], tele_left_grip, tele_right_grip)
+                    rollback_buffer.append_if_moved(sol_q[:14], sol_tauff[:14], tele_left_grip, tele_right_grip)
                     if args.rl_online:
                         command = qpos_command(sol_q[:14], tele_left_grip, tele_right_grip)
                         left_pose, right_pose = arm_ik.solve_fk_matrix(
