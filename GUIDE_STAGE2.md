@@ -7,8 +7,7 @@
 - 机器人是 G1D，控制仍是这套 DDS、对齐和 30 Hz 执行。
 - 动作是 16 维原始 AbsQpos，`[L7, LG, R7, RG]`，chunk 长度 64。
 - 裁剪用倒豆子 checkpoint 里的值（clip 约 `[-2.164, 6.031]`），不改成 Franka 的末端位姿尺度。
-- 残差上限 `edit_scale` 在线用 0.05 rad（约 2.9°，写在 `rlt_online_pourbeans.yaml`），不用 checkpoint 里的 0.2：离线 actor 把 tanh 推到饱和，0.2 时平均改动约 6°、每块都顶到 11.5°，一执行就失败；演示动作与 Motus 参考的差距中位数只有 0.014 rad，0.05 仍覆盖其中 75%。`actor_noise_sigma=0.03` 加在 tanh 之前，乘上上限后约 0.1°，对幅度基本没有影响。
-- Motus 每次给出一条参考动作。EXPO 的 4 个 base 槽位都是这一条；另外 4 个是 actor 残差，4 个是 BC actor。
+- 残差上限按关节设（`edit_scale_per_joint`，对应 Franka 同名字段，写在 `rlt_online_pourbeans.yaml`），顺序 `[L7, LG, R7, RG]`，每维取接管数据里 |人工动作 − Motus 参考| 的中位数，最低 0.05 rad。统一的 0.05（约 2.9°）太紧：离线 actor 的 tanh 是饱和的，改动每块都顶在 0.05，而人工修正平均 0.148 rad、61% 的步超过 0.05，且越往块尾差距越大（第 0 步 0.033，第 63 步 0.203）。参考每块重新锚定，偏移不会累积，所以手臂会停在“参考 + 0.05”到不了位。checkpoint 里的 0.2 又太大，一执行就失败。`edit_scale` 0.05 仍是没有按关节上限时的回退值。`actor_noise_sigma=0.03` 加在 tanh 之前，对幅度基本没有影响。
 
 不要占用 `15555`。那是另一台 GPU 部署策略的本地口。在线训练走机器人本机 `127.0.0.1:16556`。
 
@@ -30,9 +29,11 @@ CUDA_VISIBLE_DEVICES=0,1 .venv/bin/python train/serve_rlt_online.py \
 
 每次 `episode_end` 之后，服务端把完整在线状态（actor/critic、target、BC actor、优化器、replay、intervention、偏好 buffer、计数器）存到 `outputs/rlt_online_pourbeans/online_state.pt`。重启时加 `--resume outputs/rlt_online_pourbeans/online_state.pt` 接着训，warmup 不用重攒（对应 Franka 的 `resume_checkpoint`）。先把这个文件复制一份再重启，防止新进程第一次保存时覆盖。
 
-和 Franka 对齐的几处：EXPO 的 4 个 base 是 4 条独立采样的 Motus 参考（一次批量推理），TD 备份在下一状态也用 4 条独立参考；transition 的下一帧和紧接着的 `act` 是同一帧，服务端缓存这次编码，所以每个块边界仍只算一次（约 3 s）。`act` 日志里的 `ref_spread` 是 4 条参考之间的最大差，`edit` 是执行动作相对所选参考的最大改动。
+和 Franka 对齐的几处：EXPO 的 4 个 base 是 4 条独立采样的 Motus 参考（一次批量推理），TD 备份在下一状态也用 4 条独立参考；transition 的下一帧和紧接着的 `act` 是同一帧，服务端缓存这次编码，所以每个块边界仍只算一次（约 3 s）。`act` 日志里的 `ref_spread` 是 4 条参考之间的最大差，`edit` 是执行动作相对所选参考的最大改动（按关节上限后最大可到 0.174）。
 
-额外加的（Franka 没有）：`success_bc_beta: 1.0`。按 Y 成功的回合，其策略块、接管块和滑窗都标成成功样本，离线演示也算成功样本；actor 更新时对这些样本加 BC 项，把输出拉向实际执行的动作，损失除以 `edit_scale^2`。
+服务端在滑窗写进 buffer 之后也会再存一次，重启不会丢最后一条轨迹的滑窗。
+
+额外加的（Franka 没有）：`success_bc_beta: 1.0`。按 Y 成功的回合，其策略块、接管块和滑窗都标成成功样本，离线演示也算成功样本；actor 更新时对这些样本加 BC 项，把输出拉向实际执行的动作，每维误差先除以该维的上限再平方。
 
 日志出现 `RLT online server listening on tcp://127.0.0.1:5555` 后再开隧道。服务只绑本机，不要改成 `0.0.0.0`。启动要加载两份 Motus，约 4–5 分钟。
 
