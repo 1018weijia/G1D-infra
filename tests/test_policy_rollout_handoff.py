@@ -37,6 +37,24 @@ from teleop.utils.rollback import PolicyRollbackBuffer, ease_out_playback
 
 
 class PolicyRolloutHandoffTests(unittest.TestCase):
+    def test_binocular_head_is_stitched_as_the_left_eye_only(self):
+        adapter = PolicyAdapter("configs/infer_g1d.yaml", swap_wrists=False)
+        head = np.zeros((480, 1280, 3), dtype=np.uint8)
+        head[:, :640] = (10, 20, 200)
+        head[:, 640:] = (90, 90, 90)
+        left = np.full((480, 640, 3), 40, dtype=np.uint8)
+        right = np.full((480, 640, 3), 70, dtype=np.uint8)
+        out = adapter.stitch_rgb(head, left, right)
+        self.assertEqual(out.shape, (384, 320, 3))
+        # Training layout: 12 black rows, 240x320 left eye, 120 rows of wrists, 12 black.
+        self.assertEqual(int(out[:12].max()), 0)
+        self.assertTrue(np.all(out[12:252] == (200, 20, 10)))
+        self.assertTrue(np.all(out[252:372, :160] == 40))
+        self.assertTrue(np.all(out[252:372, 160:] == 70))
+        self.assertEqual(int(out[372:].max()), 0)
+        mono = adapter.stitch_rgb(head[:, :640], left, right)
+        self.assertTrue(np.array_equal(out, mono))
+
     def test_qpos_conversion_order(self):
         row = np.arange(16, dtype=float)
         arm_q, left_grip, right_grip = PolicyAdapter.qpos_action_to_g1_action(row)

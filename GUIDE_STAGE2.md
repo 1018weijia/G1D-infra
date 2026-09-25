@@ -41,6 +41,8 @@ tmux new-session -d -s rl-tunnel 'while true; do ssh -N -o BatchMode=yes -o Exit
 
 不要再用训练机经 tailscale 打的 `-R 16555` 反向隧道。那条走 userspace tailscale，实测一帧 act 要 50s，这条是 3s 以内。
 
+图像版式必须和 Stage 1、离线 buffer、Motus 训练一致：头部只用左眼（`cam_left_high`，480x640 缩到 240x320），下面两个腕部各 120x160，上下各 12 px 黑边。头部相机是 480x1280 双目，客户端在拼接前只取左半边；逐像素已和 MotusV2 `_stitch_t_shape` 对齐。旧客户端把整张双目塞进 120 px 的条带，服务端会识别并还原，同时打警告。
+
 图像按 JPEG q90 发送（一帧约 20 KB，原始是 369 KB）。机器人上行只有约 1 Mbit/s，64 步的 transition 从约 24 MB 降到约 1.3 MB。
 
 ## 3. 机器人上开客户端

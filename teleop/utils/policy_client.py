@@ -666,11 +666,13 @@ class PolicyAdapter:
         return arm_action, float(raw[14]), float(raw[15])
 
     def _resize_with_padding(self, img, target_hw):
+        # Same as MotusV2 data/utils/image_utils.resize_with_padding, which
+        # built every training frame: floor sizes, cv2 default (linear) resize.
         th, tw = target_hw
         h, w = img.shape[:2]
         scale = min(tw / w, th / h)
-        new_w, new_h = int(round(w * scale)), int(round(h * scale))
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h))
         canvas = np.zeros((th, tw, img.shape[2] if img.ndim == 3 else 1), dtype=img.dtype)
         y0 = (th - new_h) // 2
         x0 = (tw - new_w) // 2
@@ -722,10 +724,23 @@ class PolicyAdapter:
         )
         return canvas.astype(np.float32) / 255.0
 
+    @staticmethod
+    def head_left_eye(head_img):
+        """Training used only ``cam_left_high`` (480x640). The G1-D head streams
+        both eyes side by side (480x1280); keep the left half.
+
+        A 4:3 camera is at most 1.34x as wide as it is tall, a stereo pair is
+        2.67x, so anything at least twice as wide is treated as binocular.
+        """
+        h, w = head_img.shape[:2]
+        if w >= 2 * h:
+            return head_img[:, : w // 2]
+        return head_img
+
     def stitch_rgb(self, head_bgr, left_wrist_bgr, right_wrist_bgr):
         if head_bgr is None or left_wrist_bgr is None or right_wrist_bgr is None:
             raise ValueError("missing required camera frame")
-        head_rgb = cv2.cvtColor(head_bgr, cv2.COLOR_BGR2RGB)
+        head_rgb = cv2.cvtColor(self.head_left_eye(head_bgr), cv2.COLOR_BGR2RGB)
         left_rgb = cv2.cvtColor(left_wrist_bgr, cv2.COLOR_BGR2RGB)
         right_rgb = cv2.cvtColor(right_wrist_bgr, cv2.COLOR_BGR2RGB)
         if self.swap_wrists:
