@@ -40,11 +40,13 @@ from teleop.utils.policy_client import PolicyAdapter, PolicyRemoteClient
 from teleop.utils.rlt_online import (
     RL_MAX_ABS_ARM_Q,
     RL_MAX_ABS_GRIPPER_Q,
-    PROGRESS_REWARD,
+    CreditMarks,
     RLTRollout,
-    SUCCESS_REWARD,
+    RewardKeys,
     TeleopChunker,
     TeleopMotionGate,
+    credit_plan,
+    last_step_rewards,
     outcome_ends_without_chunk,
     resolve_observation,
     resolve_step_observations,
@@ -109,7 +111,10 @@ A_DEBOUNCE_UNTIL = 0.0
 KEY_LISTENER_STOP = threading.Event()
 RL_ONLINE = False
 RL_OUTCOME_REQUEST = None
-RL_PENDING_STEP_REWARD = 0.0
+# remote-franka keys: p/o/x queue a reward for the next stored chunk, q marks
+# chunks bad without moving the robot.
+RL_REWARD_KEYS = RewardKeys()
+RL_CREDIT = CreditMarks()
 # Set in POLICY_PAUSED: continue the policy, or close as "success"/"failure".
 PAUSE_CONTINUE = False
 PAUSE_OUTCOME = None
@@ -118,22 +123,38 @@ PAUSE_OUTCOME = None
 def on_press(key, source="keyboard"):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
     global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT, RL_OUTCOME_REQUEST
-    global RL_PENDING_STEP_REWARD, PAUSE_CONTINUE, PAUSE_OUTCOME
+    global PAUSE_CONTINUE, PAUSE_OUTCOME
+    if key == "quit":
+        STOP = True
+        return
     if RL_ONLINE and RUN_PHASE == POLICY_PAUSED and key in ("y", "n"):
         PAUSE_OUTCOME = "success" if key == "y" else "failure"
         logger_mp.info("[on_press] %s: close this episode as %s.", key.upper(), PAUSE_OUTCOME)
         return
-    if RL_ONLINE and key in ("y", "n", "p"):
+    if RL_ONLINE and key in ("p", "o", "x"):
+        if RUN_PHASE not in (POLICY_LIVE, TELEOP_LIVE):
+            logger_mp.warning("[on_press] %s ignored in %s.", key.upper(), RUN_PHASE)
+            return
+        reward = RL_REWARD_KEYS.press(key)
+        logger_mp.info(
+            "[on_press] %s: reward %+.1f queued for the last step of the %s chunk.",
+            key.upper(), reward, "current" if RUN_PHASE == POLICY_LIVE else "takeover",
+        )
+        return
+    if RL_ONLINE and key == "q":
+        if RUN_PHASE not in (POLICY_LIVE, POLICY_PAUSED):
+            logger_mp.warning("[on_press] Q ignored in %s.", RUN_PHASE)
+            return
+        count = RL_CREDIT.press()
+        logger_mp.info(
+            "[on_press] Q: %d chunk(s) marked bad (credit cut, the robot keeps going).", count,
+        )
+        return
+    if RL_ONLINE and key in ("y", "n"):
         if RUN_PHASE != POLICY_LIVE:
             logger_mp.warning("[on_press] %s ignored outside POLICY_LIVE (phase=%s).", key.upper(), RUN_PHASE)
             return
-        if key == "p":
-            RL_PENDING_STEP_REWARD += PROGRESS_REWARD
-            logger_mp.info("[on_press] P: +%.1f on the current step.", PROGRESS_REWARD)
-            return
         RL_OUTCOME_REQUEST = "success" if key == "y" else "failure"
-        if key == "y":
-            RL_PENDING_STEP_REWARD += SUCCESS_REWARD
         logger_mp.info(
             "[on_press] %s: episode ends as %s. A running chunk finishes first; "
             "otherwise the arm returns to the ready pose now.",
@@ -210,7 +231,7 @@ def _stdin_key_loop(on_press_cb, stop_event):
                 time.sleep(0.01)
                 continue
             if ch == "\x03":
-                on_press_cb("q")
+                on_press_cb("quit")
                 continue
             if ch == "\x1b":
                 time.sleep(0.005)
@@ -369,9 +390,12 @@ def _upload_takeover_chunk(remote, chunk, instruction, rollout):
         episode_id=chunk["episode_id"], chunk_id=chunk["chunk_id"], observation=start,
     )
     _note_stride(rollout, reply)
+    rewards = chunk.get("rewards")
+    if rewards is None:
+        rewards = np.zeros(actions.shape[0], dtype=np.float32)
     remote.report_transition(
         reply["transition_id"], None, None, instruction,
-        np.zeros(actions.shape[0], dtype=np.float32),
+        np.asarray(rewards, dtype=np.float32),
         done=False,
         bootstrap_mask=1.0,
         action_chunk=actions,
@@ -382,9 +406,9 @@ def _upload_takeover_chunk(remote, chunk, instruction, rollout):
         next_observation=nxt,
     )
     logger_mp.info(
-        "RL takeover chunk sent id=%s chunk=%d steps=%d step_obs=%d",
+        "RL takeover chunk sent id=%s chunk=%d steps=%d step_obs=%d reward=%.1f",
         reply["transition_id"], chunk["chunk_id"], actions.shape[0],
-        sum(item is not None for item in steps),
+        sum(item is not None for item in steps), float(np.sum(rewards)),
     )
     return {"kind": "reported"}
 
@@ -903,6 +927,8 @@ if __name__ == "__main__":
             chunk = teleop_chunker.close(next_obs)
             if chunk is None:
                 return
+            if RL_REWARD_KEYS.pending:
+                chunk["rewards"] = last_step_rewards(chunk["actions"].shape[0], RL_REWARD_KEYS.take())
             _send_or_defer({"rlt": True, "takeover": chunk, "flush_steps": rollout.wait_step_images})
             logger_mp.info(
                 "Takeover chunk %d recorded: steps=%d uploads_waiting=%d",
@@ -952,27 +978,39 @@ if __name__ == "__main__":
             )
             return True
 
-        def _finish_episode(outcome, terminal_reward, reason):
+        def _send_credit_marks(reason):
+            """Send pending q marks against the chunks already stored."""
+            count = RL_CREDIT.take()
+            if count:
+                _send_or_defer({
+                    "rlt": True,
+                    "rewind": {**credit_plan(count), "episode_id": rollout.episode_id,
+                               "chunk_id": rollout.next_chunk_id},
+                })
+                logger_mp.info("RL credit cut on the last %d stored chunk(s) (%s).", count, reason)
+
+        def _finish_episode(outcome, reason):
             """Close the episode on its last stored chunk and return to the ready pose.
 
             The episode_end report queues behind any uploads still pending, so it
-            always closes the chunk that was stored last.
+            always closes the chunk that was stored last. As in remote-franka, the
+            outcome replaces any queued p/o/x reward.
             """
-            global RL_OUTCOME_REQUEST, RL_PENDING_STEP_REWARD, idle_discard_id
+            global RL_OUTCOME_REQUEST, idle_discard_id
             global policy_inference_enabled, START_POLICY, action_queue
             global last_arm_q, last_tau, RUN_PHASE, idle_hint_time
+            _send_credit_marks("before the episode end")
             job = {
                 "rlt": True,
                 "episode_end_only": True,
                 "success": outcome == "success",
                 "episode_id": rollout.episode_id,
-                "terminal_reward": float(terminal_reward),
+                "terminal_reward": RL_REWARD_KEYS.take(outcome),
             }
             if idle_discard_id:
                 job["discard_id"] = idle_discard_id
             _send_or_defer(job)
             RL_OUTCOME_REQUEST = None
-            RL_PENDING_STEP_REWARD = 0.0
             idle_discard_id = None
             policy_inference_enabled = False
             START_POLICY = False
@@ -1052,9 +1090,11 @@ if __name__ == "__main__":
             START_POLICY = False
             logger_mp.info(
                 "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again (or S)=%s, Q=quit.%s",
+                "B=rollback, gamepad A=take over, gamepad A again (or S)=%s, %s.%s",
                 "end takeover and pause" if args.rl_online else "return policy",
-                " Y=success, N=failure. While paused: terminal A=continue, S or Y=success, N=failure."
+                "Ctrl+C=quit" if args.rl_online else "Q=quit",
+                " Y=success, N=failure, P=+0.5, O=+0.1 (stacks), X=-0.5, Q=mark chunk bad (credit)."
+                " While paused: terminal A=continue, S or Y=success, N=failure."
                 if args.rl_online else "",
             )
 
@@ -1139,8 +1179,7 @@ if __name__ == "__main__":
                     outcome = PAUSE_OUTCOME
                     PAUSE_OUTCOME = None
                     PAUSE_CONTINUE = False
-                    reward = SUCCESS_REWARD if outcome == "success" else 0.0
-                    _finish_episode(outcome, reward, "paused after takeover")
+                    _finish_episode(outcome, "paused after takeover")
                     continue
                 if PAUSE_CONTINUE:
                     PAUSE_CONTINUE = False
@@ -1167,13 +1206,14 @@ if __name__ == "__main__":
                 recording = _start_record_episode(args, recorder, recording)
                 if args.rl_online:
                     RL_OUTCOME_REQUEST = None
-                    RL_PENDING_STEP_REWARD = 0.0
+                    RL_REWARD_KEYS.clear()
+                    RL_CREDIT.take()
                     rl_report_due = False
                     idle_discard_id = None
                     teleop_chunker.close(None)
                     episode_id = rollout.begin_episode()
                     logger_mp.info(
-                        "RL episode %d started from the ready pose. Y=success, N=failure.",
+                        "RL episode %d started. Y=success N=failure P=+0.5 O=+0.1 X=-0.5 Q=mark bad.",
                         episode_id,
                     )
                 else:
@@ -1213,6 +1253,15 @@ if __name__ == "__main__":
                     rl_event = rollout.interrupt()
                 if args.rl_online:
                     _flush_teleop_chunk()
+                    # remote-franka drops queued reward keys on rewind and does
+                    # not mix physical rewind with q credit marks.
+                    RL_REWARD_KEYS.clear()
+                    dropped = RL_CREDIT.take()
+                    if dropped:
+                        logger_mp.warning(
+                            "Q marks (%d) dropped: the physical rollback labels this chunk instead.",
+                            dropped,
+                        )
                 policy_inference_enabled = False
                 invalidate_inference()
                 action_queue.clear()
@@ -1340,6 +1389,9 @@ if __name__ == "__main__":
                 except (ValueError, np.linalg.LinAlgError) as marker_error:
                     logger_mp.debug("Unable to update live EEF markers: %s", marker_error)
 
+            if args.rl_online:
+                RL_CREDIT.resolve(RUN_PHASE == POLICY_LIVE and rollout.open is not None)
+
             if RUN_PHASE == POLICY_LIVE:
                 with inference_lock:
                     ready_queue = inference_state["result"]
@@ -1362,6 +1414,10 @@ if __name__ == "__main__":
                                 idle_discard_id,
                             )
                         else:
+                            if RL_CREDIT.count and not RL_CREDIT.include_running:
+                                # q came while nothing ran: mark stored chunks
+                                # before this one's transition can be stored.
+                                _send_credit_marks("q pressed between chunks")
                             model_actions = ready_queue.get("model_actions")
                             if model_actions is not None:
                                 teleop_chunker.chunk_len = int(np.asarray(model_actions).shape[0])
@@ -1421,9 +1477,6 @@ if __name__ == "__main__":
                         except Exception as observe_error:
                             logger_mp.debug("RL step observation skipped: %s", observe_error)
                             rollout.on_step()
-                        if RL_PENDING_STEP_REWARD:
-                            rollout.add_step_reward(RL_PENDING_STEP_REWARD)
-                            RL_PENDING_STEP_REWARD = 0.0
                         if rollout.chunk_finished() and not action_queue:
                             rl_report_due = True
                             chunk_just_finished = True
@@ -1446,6 +1499,14 @@ if __name__ == "__main__":
                                 frame, state, arm_q = _prepare_policy_request(
                                     adapter, img_client, arm_ctrl
                                 )
+                                if not chunk.get("keys_applied"):
+                                    # remote-franka: the queued key (or Y/N) sets
+                                    # the chunk's last-step reward.
+                                    chunk["rewards"] = last_step_rewards(
+                                        int(np.asarray(chunk["actions"]).shape[0]),
+                                        RL_REWARD_KEYS.take(outcome),
+                                    )
+                                    chunk["keys_applied"] = True
                                 fields = transition_fields(
                                     int(chunk["actions"].shape[0]), outcome, False
                                 )
@@ -1454,6 +1515,15 @@ if __name__ == "__main__":
                                 )
                                 job["flush_steps"] = rollout.wait_step_images
                                 job["pending_chunk"] = chunk
+                                credit = RL_CREDIT.count if RL_CREDIT.include_running else 0
+                                if credit:
+                                    # Sent after this transition, so the chunk
+                                    # that was running counts as the first bad one.
+                                    job["rewind"] = {
+                                        **credit_plan(credit),
+                                        "episode_id": rollout.episode_id,
+                                        "chunk_id": rollout.next_chunk_id,
+                                    }
                                 if not fields["done"] and policy_inference_enabled:
                                     job["act"] = (
                                         frame, state, arm_q,
@@ -1463,6 +1533,12 @@ if __name__ == "__main__":
                                     rl_inflight = job
                                     rl_report_due = False
                                     chunk = None
+                                    if credit:
+                                        RL_CREDIT.take()
+                                        logger_mp.info(
+                                            "RL credit cut: this chunk and %d earlier marked bad.",
+                                            credit - 1,
+                                        )
                                     if fields["done"]:
                                         policy_inference_enabled = False
                                         START_POLICY = False
@@ -1511,9 +1587,7 @@ if __name__ == "__main__":
                             # A policy act still on the wire would start a chunk
                             # the operator no longer wants; its reply is discarded.
                             invalidate_inference()
-                        _finish_episode(
-                            RL_OUTCOME_REQUEST, float(RL_PENDING_STEP_REWARD), "no chunk was running",
-                        )
+                        _finish_episode(RL_OUTCOME_REQUEST, "no chunk was running")
                         continue
                     elif (policy_inference_enabled and rollout.open is None
                             and not rl_report_due and not action_queue

@@ -10,10 +10,14 @@ import zmq
 from teleop.utils.policy_client import PolicyRemoteClient
 from teleop.utils.rlt_online import (
     REQUEST_KEY,
+    CreditMarks,
     RLTRollout,
+    RewardKeys,
     TeleopChunker,
     TeleopMotionGate,
     chunk_rewards,
+    credit_plan,
+    last_step_rewards,
     outcome_ends_without_chunk,
     qpos_command,
     resolve_observation,
@@ -56,6 +60,42 @@ def _serve(sock, seen, stop):
 
 
 class RLTOnlineTests(unittest.TestCase):
+    def test_reward_keys_follow_remote_franka(self):
+        keys = RewardKeys()
+        self.assertEqual(keys.take(), 0.0)
+        keys.press("o")
+        keys.press("o")
+        self.assertAlmostEqual(keys.press("o"), 0.3, places=6)
+        self.assertAlmostEqual(keys.take(), 0.3, places=6)
+        self.assertFalse(keys.pending)
+        keys.press("o")
+        self.assertEqual(keys.press("p"), 0.5)
+        self.assertEqual(keys.press("x"), -0.5)
+        self.assertEqual(keys.take(), -0.5)
+        keys.press("p")
+        self.assertEqual(keys.take("success"), 1.0)
+        keys.press("o")
+        self.assertEqual(keys.take("failure"), 0.0)
+        self.assertEqual(last_step_rewards(4, 0.5).tolist(), [0.0, 0.0, 0.0, 0.5])
+        self.assertEqual(last_step_rewards(0, 1.0).shape, (0,))
+
+    def test_q_marks_count_back_from_the_chunk_that_was_running(self):
+        marks = CreditMarks()
+        marks.resolve(True)
+        self.assertIsNone(marks.include_running)
+        self.assertEqual(marks.press(), 1)
+        marks.resolve(True)
+        self.assertEqual(marks.press(), 2)
+        marks.resolve(False)
+        self.assertTrue(marks.include_running)
+        self.assertEqual(marks.take(), 2)
+        self.assertEqual(marks.count, 0)
+        self.assertIsNone(marks.include_running)
+        plan = credit_plan(2)
+        self.assertEqual((plan["mode"], plan["chunks"]), ("credit", 2))
+        self.assertAlmostEqual(plan["terminal_reward"], -0.2)
+        self.assertAlmostEqual(plan["prefix_reward"], 0.1)
+
     def test_holding_still_after_handoff_is_not_a_takeover_step(self):
         gate = TeleopMotionGate()
         pose = np.eye(4)

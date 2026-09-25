@@ -26,8 +26,12 @@ ACTION_SPACE_ROBOT = "robot"
 # remote-franka stage2.server.franka: rewind_physical_exit_reward / credit.
 REWIND_TERMINAL_REWARD = -0.2
 REWIND_PREFIX_REWARD = 0.1
+# remote-franka franka_inference_node_rlt.py RLTArgs defaults.
 PROGRESS_REWARD = 0.5
+SMALL_PROGRESS_REWARD = 0.1
+REGRESS_REWARD = -0.5
 SUCCESS_REWARD = 1.0
+FAILURE_REWARD = 0.0
 # The robot uplink is about 1 Mbit/s. A raw 384x320 frame is 369 KB, JPEG q90
 # is about 20 KB, so a 64-step transition drops from ~24 MB to ~1.3 MB.
 JPEG_QUALITY = 90
@@ -61,6 +65,111 @@ def transition_fields(
         "done": done,
         "bootstrap_mask": 0.0 if done else 1.0,
         "intervention": bool(intervention),
+    }
+
+
+class RewardKeys:
+    """remote-franka keyboard reward queue (``_queue_reward_signal``).
+
+    One signal per transition: the last key wins, except ``o`` which stacks
+    +0.1 until the transition that consumes it. ``p``/``x`` and an outcome
+    reset the ``o`` stack. The reward lands on the transition's last step.
+    """
+
+    _SIGNALS = {"p": "progress", "o": "progress_small", "x": "regress"}
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.signal: Optional[str] = None
+        self.small = 0.0
+
+    def press(self, key: str) -> float:
+        """Queue ``p``/``o``/``x``; returns the reward it will write."""
+        signal = self._SIGNALS[key]
+        with self._lock:
+            if signal == "progress_small":
+                self.small += SMALL_PROGRESS_REWARD
+            else:
+                self.small = 0.0
+            self.signal = signal
+            return self._value(None)
+
+    def _value(self, outcome: Optional[str]) -> float:
+        if outcome == "success":
+            return SUCCESS_REWARD
+        if outcome == "failure":
+            return FAILURE_REWARD
+        if self.signal == "progress":
+            return PROGRESS_REWARD
+        if self.signal == "regress":
+            return REGRESS_REWARD
+        if self.signal == "progress_small":
+            return self.small
+        return 0.0
+
+    def take(self, outcome: Optional[str] = None) -> float:
+        """Reward for the transition that consumes the queue; clears it."""
+        with self._lock:
+            value = self._value(outcome)
+            self.signal = None
+            self.small = 0.0
+            return float(value)
+
+    def clear(self) -> None:
+        with self._lock:
+            self.signal = None
+            self.small = 0.0
+
+    @property
+    def pending(self) -> bool:
+        return self.signal is not None
+
+
+def last_step_rewards(steps: int, reward: float) -> np.ndarray:
+    """remote-franka puts a chunk's key reward on its last executed step."""
+    rewards = np.zeros(int(steps), dtype=np.float32)
+    if rewards.size:
+        rewards[-1] = float(reward)
+    return rewards
+
+
+class CreditMarks:
+    """``q`` presses: mark chunks bad without moving the robot (rewind credit).
+
+    Each press marks one more chunk, counting back from the one executing when
+    ``q`` was first pressed (or the last stored one if none was executing).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.count = 0
+        self.include_running: Optional[bool] = None
+
+    def press(self) -> int:
+        with self._lock:
+            self.count += 1
+            return self.count
+
+    def resolve(self, chunk_running: bool) -> None:
+        """Fix, once, whether the first press was during an executing chunk."""
+        with self._lock:
+            if self.count and self.include_running is None:
+                self.include_running = bool(chunk_running)
+
+    def take(self) -> int:
+        with self._lock:
+            count = self.count
+            self.count = 0
+            self.include_running = None
+            return count
+
+
+def credit_plan(chunks: int) -> dict:
+    return {
+        "mode": "credit",
+        "chunks": int(chunks),
+        "terminal_reward": REWIND_TERMINAL_REWARD,
+        "prefix_reward": REWIND_PREFIX_REWARD,
     }
 
 
