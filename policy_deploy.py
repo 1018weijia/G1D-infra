@@ -603,6 +603,11 @@ if __name__ == "__main__":
     parser.add_argument("--config-path", type=str, required=True)
     parser.add_argument("--instruction", type=str, required=True)
     parser.add_argument("--rollback-seconds", type=float, default=3.0)
+    parser.add_argument(
+        "--no-rollback", action="store_true",
+        help="B stops the arm where it is and goes straight to alignment; the "
+             "RL reports and labels are the same as with the physical rollback.",
+    )
     parser.add_argument("--alignment-target-config",
                         default=os.path.join(REPO_ROOT, "configs", "alignment_targets.json"))
     parser.add_argument("--alignment-position-tolerance", type=float, default=0.04)
@@ -1118,7 +1123,8 @@ if __name__ == "__main__":
             START_POLICY = False
             logger_mp.info(
                 "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again (or S)=%s, %s.%s",
+                "B=%s, gamepad A=take over, gamepad A again (or S)=%s, %s.%s",
+                "stop in place (no rollback)" if args.no_rollback else "rollback",
                 "end takeover and pause" if args.rl_online else "return policy",
                 "Ctrl+C=quit" if args.rl_online else "Q=quit",
                 " Y=success, N=failure, P=+0.5, O=+0.1 (stacks), X=-0.5, Q=mark chunk bad (credit)."
@@ -1346,14 +1352,21 @@ if __name__ == "__main__":
                             "Failed to report interrupted RL chunk: %s", report_error
                         )
                 reset_handoff_runtime(handoff)
-                ease_steps = max(2, int(round(ROLLBACK_EASE_SECONDS * args.frequency)))
-                rollback_sequence = ease_out_playback(raw_rollback, ease_steps)
                 RUN_PHASE = POLICY_ROLLBACK
-                logger_mp.info(
-                    "Rollback requested: replaying %d frames; slowing the last %.2fs of the path to a stop",
-                    len(rollback_sequence),
-                    ROLLBACK_EASE_SECONDS,
-                )
+                if args.no_rollback:
+                    rollback_sequence = []
+                    logger_mp.info(
+                        "Stop requested (no rollback): holding the current pose; %d frames not replayed.",
+                        len(raw_rollback),
+                    )
+                else:
+                    ease_steps = max(2, int(round(ROLLBACK_EASE_SECONDS * args.frequency)))
+                    rollback_sequence = ease_out_playback(raw_rollback, ease_steps)
+                    logger_mp.info(
+                        "Rollback requested: replaying %d frames; slowing the last %.2fs of the path to a stop",
+                        len(rollback_sequence),
+                        ROLLBACK_EASE_SECONDS,
+                    )
 
             if rollback_sequence:
                 arm_q, tau, left_grip, right_grip = rollback_sequence.pop(0)

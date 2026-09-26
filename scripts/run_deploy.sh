@@ -93,6 +93,9 @@ if [[ "${RL_ONLINE:-0}" == "1" ]]; then
   RL_ARGS+=(--rl-online)
   POLICY_PREFETCH_STEPS=0
 fi
+if [[ "${NO_ROLLBACK:-0}" == "1" ]]; then
+  RL_ARGS+=(--no-rollback)
+fi
 python policy_deploy.py \
   --config-path "$CONFIG_PATH" \
   --ready-pose-config "$READY_POSE_CONFIG" \
