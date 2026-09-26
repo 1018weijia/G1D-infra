@@ -3,6 +3,7 @@ import argparse
 import fcntl
 import logging_mp
 import os
+import signal
 import sys
 import termios
 import threading
@@ -87,11 +88,43 @@ ALIGNMENT_STATE = None
 A_LAST_CHAR_AT = 0.0
 A_DEBOUNCE_UNTIL = 0.0
 KEY_LISTENER_STOP = threading.Event()
+# Y/N close the current trial and return the arms to the ready pose.
+END_REQUEST = None
+EVAL_TALLY = {"success": 0, "failure": 0}
+
+
+def _tally_text():
+    total = EVAL_TALLY["success"] + EVAL_TALLY["failure"]
+    rate = 100.0 * EVAL_TALLY["success"] / total if total else 0.0
+    return f"{EVAL_TALLY['success']}/{total} success ({rate:.0f}%)"
+
+
+def _ease_to_home(arm_ctrl, arm_ik, seconds, frequency):
+    """Glide both arms to the zero home pose on exit instead of snapping there.
+
+    ``ctrl_dual_arm_go_home`` jumps the target to zero and the controller only
+    limits joint speed to 30 rad/s, so the arms slam home in ~0.2 s. The eased
+    profile gets there first; go_home then only confirms the pose.
+    """
+    if arm_ik is not None:
+        logger_mp.info("Easing both arms to home over %.1fs.", seconds)
+        move_to_ready_pose(
+            arm_ctrl, arm_ik, np.zeros(14), seconds, frequency,
+            grippers=_read_grippers(arm_ctrl), settle_seconds=0.5,
+        )
+    arm_ctrl.ctrl_dual_arm_go_home()
 
 
 def on_press(key):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
-    global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT
+    global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT, END_REQUEST
+    if key in ("y", "n"):
+        if RUN_PHASE == POLICY_IDLE:
+            logger_mp.warning("[on_press] %s ignored: no trial is running. Press S to start one.", key.upper())
+            return
+        END_REQUEST = "success" if key == "y" else "failure"
+        logger_mp.info("[on_press] %s: trial ends as %s; returning to the ready pose.", key.upper(), END_REQUEST)
+        return
     action, A_LAST_CHAR_AT = interpret_key(
         key, RUN_PHASE, time.monotonic(), A_DEBOUNCE_UNTIL, A_LAST_CHAR_AT, A_GAP_S,
     )
@@ -322,6 +355,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ready-pose-seconds", type=float, default=3.0,
         help="seconds to move from the current pose to the raised startup pose",
+    )
+    parser.add_argument(
+        "--home-seconds", type=float, default=4.0,
+        help="seconds to glide both arms to the zero home pose on exit",
     )
     parser.add_argument("--swap-wrists", action="store_true", default=True)
     parser.add_argument("--no-swap-wrists", action="store_false", dest="swap_wrists")
@@ -598,7 +635,8 @@ if __name__ == "__main__":
             START_POLICY = False
             logger_mp.info(
                 "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, Q=quit."
+                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, "
+                "Y=success / N=failure (end the trial, back to the ready pose), Q=quit."
             )
 
         while not STOP:
@@ -636,6 +674,38 @@ if __name__ == "__main__":
             START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
                 RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
             )
+
+            if END_REQUEST is not None:
+                outcome, END_REQUEST = END_REQUEST, None
+                policy_inference_enabled = False
+                invalidate_inference()
+                action_queue = []
+                prefetched_queue = []
+                rollback_sequence = []
+                rollback_buffer.clear()
+                START_POLICY = RESUME_POLICY = ALIGN_CONFIRM = ROLLBACK_REQUEST = False
+                if RUN_PHASE == TELEOP_LIVE:
+                    last_left_grip, last_right_grip = _read_grippers(arm_ctrl)
+                clear_handoff_runtime()
+                EVAL_TALLY[outcome] += 1
+                logger_mp.info(
+                    "Trial %d ends as %s (from %s); %s. Returning to the ready pose.",
+                    EVAL_TALLY["success"] + EVAL_TALLY["failure"], outcome, RUN_PHASE, _tally_text(),
+                )
+                ready_result = move_to_ready_pose(
+                    arm_ctrl,
+                    arm_ik,
+                    ready_pose_q,
+                    args.ready_pose_seconds,
+                    args.frequency,
+                    grippers=(last_left_grip, last_right_grip),
+                    stop_requested=lambda: STOP,
+                )
+                last_arm_q = ready_result.arm_q.copy()
+                last_tau = ready_result.tau.copy()
+                RUN_PHASE = POLICY_IDLE
+                logger_mp.info("Ready pose reached. Press S to start the next trial.")
+                continue
 
             if START_POLICY and RUN_PHASE == POLICY_IDLE:
                 START_POLICY = False
@@ -990,11 +1060,16 @@ if __name__ == "__main__":
             remote.close()
         if worker is not None:
             worker.join(timeout=2.0)
+        logger_mp.info("Trials this run: %s", _tally_text())
+        # A second Ctrl+C must not stop the arms half way home.
+        previous_sigint = signal.signal(signal.SIGINT, signal.SIG_IGN)
         try:
             if arm_ctrl is not None:
-                arm_ctrl.ctrl_dual_arm_go_home()
+                _ease_to_home(arm_ctrl, globals().get("arm_ik"), args.home_seconds, args.frequency)
         except Exception as home_error:
             logger_mp.error("Failed to go home: %s", home_error)
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
         try:
             KEY_LISTENER_STOP.set()
             listen_keyboard_thread.join(timeout=1.0)
