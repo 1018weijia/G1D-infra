@@ -28,6 +28,7 @@ from teleop.utils.arm_owner_lock import ArmOwnerLockError, acquire_arm_owner_loc
 from teleop.utils.dex1_arm_bundle import create_dex1_arm_controller
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.handoff_utils import smoothstep_handoff_gain
+from teleop.utils.ready_pose import cycle_grippers_then_open
 from teleop.utils.rerun_visualizer import should_log_to_rerun
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.controller_shortcuts import ControllerShortcutMapper, toggle_start_pause
@@ -226,6 +227,14 @@ if __name__ == '__main__':
                                      task_steps = args.task_steps,
                                      frequency = args.frequency, 
                                      rerun_log = should_log_to_rerun(args.rerun, args.headless))
+
+        logger_mp.info("Cycling grippers, then holding them open. Press Q to abort.")
+        hold_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
+        if not cycle_grippers_then_open(
+                arm_ctrl, hold_q, arm_ik.solve_tau(hold_q), stop_requested=lambda: STOP):
+            logger_mp.warning("Gripper check interrupted.")
+        else:
+            arm_ctrl.clear_policy_gripper_direct()
 
         logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
         logger_mp.info("Controller shortcuts: right A=start/pause/resume, left Y=record toggle, left X=fail-stop, right B=quit")

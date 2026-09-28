@@ -65,7 +65,7 @@ INSTRUCTION="your task" \
 
 脚本会建立 `127.0.0.1:15555` 到远端推理端口的 SSH 隧道，再跑 `scripts/wait_policy.sh` 做 TCP/ZMQ 探活，通过后才启动 `policy_deploy.py`。退出时关掉本脚本创建的隧道。默认值来自 [`configs/robot_g1d.yaml`](configs/robot_g1d.yaml)，环境变量可覆盖。
 
-程序起来后会先用 smoothstep 在默认 3 秒内把双臂抬到 `configs/ready_pose.json` 的准备姿势并停住。看到 `Ready pose reached and held` 之后，再按键盘 `S` 才采集第一帧观测并请求动作。抬手过程中按的 `S` 不算，需要到位后再按一次。抬手时按 `Q` 会中止并退出。
+程序起来后先让夹爪张开、闭合、再张开并保持。随后用 smoothstep 在默认 3 秒内把双臂抬到 `configs/ready_pose.json` 的准备姿势并停住，夹爪保持张开。看到 `Ready pose reached and held` 之后，再按键盘 `S` 才采集第一帧观测并请求动作。抬手过程中按的 `S` 不算，需要到位后再按一次。抬手或夹爪预检时按 `Q` 会中止并退出。
 
 常用环境变量：`SSH_HOST`、`SSH_PORT`、`SSH_KEY`、`REMOTE_POLICY_HOST`、`REMOTE_POLICY_PORT`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`、`INSTRUCTION`、`CONFIG_PATH`、`ROLLBACK_SECONDS`、`READY_POSE_CONFIG`、`READY_POSE_SECONDS`、`WAIT_POLICY_TIMEOUT`、`TUNNEL_WAIT_SECONDS`（默认 60，跳板机慢时再加大）、`ROBOT_CONFIG`。
 
@@ -75,7 +75,7 @@ INSTRUCTION="your task" \
 
 ## 操作闭环
 
-1. 打开 Vuer 网页并进入 XR，手柄 tracking 有效。启动后机械臂会自己抬到准备姿势并停住，日志出现 `Ready pose reached and held`。
+1. 打开 Vuer 网页并进入 XR，手柄 tracking 有效。启动后夹爪先开合再停在张开，机械臂再抬到准备姿势并停住，日志出现 `Ready pose reached and held`。
 2. 终端按 `S`，从该准备姿势开始 Policy。按 `S` 之前不会请求推理。
 3. 需要接管时在终端按 `B`，等待回退完成。机械臂应减速停在回退终点，末端不要抖。
 4. 将手柄 RGB 坐标轴与画面 / XR 里的 TARGET 对齐（默认位置 ≤ 4 cm，旋转 ≤ 0.20 rad，稳定 0.5 s）。

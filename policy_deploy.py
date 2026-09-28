@@ -79,7 +79,10 @@ from teleop.utils.rollback import (
     PolicyRollbackBuffer,
     ease_out_playback,
 )
-from teleop.utils.ready_pose import ReadyPoseError, load_ready_pose, move_to_ready_pose
+from teleop.utils.ready_pose import (
+    GRIPPER_OPEN, ReadyPoseError, cycle_grippers_then_open, load_ready_pose,
+    move_to_ready_pose,
+)
 
 STOP = False
 START_POLICY = False
@@ -477,10 +480,12 @@ if __name__ == "__main__":
 
         hold_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
         hold_tau = arm_ik.solve_tau(hold_q)
-        arm_ctrl.ctrl_dual_arm(hold_q, hold_tau)
-        left_hold_grip, right_hold_grip = _read_grippers(arm_ctrl)
-        arm_ctrl.set_policy_gripper_q(left_hold_grip, right_hold_grip)
-        time.sleep(1.0)
+        logger_mp.info("Cycling grippers, then holding them open. Press Q to abort.")
+        if not cycle_grippers_then_open(
+                arm_ctrl, hold_q, hold_tau, stop_requested=lambda: STOP):
+            logger_mp.warning("Gripper check interrupted; policy was not started.")
+            STOP = True
+        left_hold_grip = right_hold_grip = GRIPPER_OPEN
 
         pad_joint_values = os.environ.get("PAD_JOINT_VALUES")
         adapter = PolicyAdapter(
@@ -621,36 +626,37 @@ if __name__ == "__main__":
             logger_mp.info("Policy resumed from %s; waiting for chunk.", from_label)
             return True
 
-        logger_mp.info(
-            "Moving both arms to the raised ready pose (%.1fs). Press Q to abort.",
-            args.ready_pose_seconds,
-        )
-        ready_result = move_to_ready_pose(
-            arm_ctrl,
-            arm_ik,
-            ready_pose_q,
-            args.ready_pose_seconds,
-            args.frequency,
-            grippers=(last_left_grip, last_right_grip),
-            stop_requested=lambda: STOP,
-        )
-        last_arm_q = ready_result.arm_q.copy()
-        last_tau = ready_result.tau.copy()
-        if not ready_result.completed:
-            logger_mp.warning("Ready-pose motion interrupted; policy was not started.")
-            STOP = True
-        else:
-            if START_POLICY:
-                logger_mp.info(
-                    "S during the ready-pose motion was ignored. Press S again to start inference."
-                )
-            START_POLICY = False
+        if not STOP:
             logger_mp.info(
-                "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again=hold teleop, "
-                "keyboard S from hold=resume policy, "
-                "F/left-X=fail-stop recorded episode, Q=quit."
+                "Moving both arms to the raised ready pose (%.1fs). Press Q to abort.",
+                args.ready_pose_seconds,
             )
+            ready_result = move_to_ready_pose(
+                arm_ctrl,
+                arm_ik,
+                ready_pose_q,
+                args.ready_pose_seconds,
+                args.frequency,
+                grippers=(last_left_grip, last_right_grip),
+                stop_requested=lambda: STOP,
+            )
+            last_arm_q = ready_result.arm_q.copy()
+            last_tau = ready_result.tau.copy()
+            if not ready_result.completed:
+                logger_mp.warning("Ready-pose motion interrupted; policy was not started.")
+                STOP = True
+            else:
+                if START_POLICY:
+                    logger_mp.info(
+                        "S during the ready-pose motion was ignored. Press S again to start inference."
+                    )
+                START_POLICY = False
+                logger_mp.info(
+                    "Ready pose reached and held. Grippers are open. Press keyboard S to start inference. "
+                    "B=rollback, gamepad A=take over, gamepad A again=hold teleop, "
+                    "keyboard S from hold=resume policy, "
+                    "F/left-X=fail-stop recorded episode, Q=quit."
+                )
 
         while not STOP:
             loop_start = time.time()

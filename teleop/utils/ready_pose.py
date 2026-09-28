@@ -9,6 +9,8 @@ import numpy as np
 ARM_DIM = 14
 MAX_ABS_ARM_Q = 3.5
 DEFAULT_READY_FREQUENCY = 30.0
+GRIPPER_CLOSED = 0.0
+GRIPPER_OPEN = 5.40
 
 
 class ReadyPoseError(ValueError):
@@ -70,6 +72,28 @@ def ready_pose_profile(current_q, target_q, seconds, frequency):
         current + (target - current) * smoothstep(i / steps)
         for i in range(1, steps + 1)
     ])
+
+
+def cycle_grippers_then_open(
+        arm_ctrl, arm_q, arm_tau, hold_seconds=0.8, stop_requested=None):
+    """Open, close, then leave both grippers open while the arm stays put.
+
+    Returns False if stop_requested fires before the grippers are left open.
+    """
+    if hold_seconds <= 0.0:
+        raise ReadyPoseError("gripper cycle hold duration must be positive")
+    should_stop = stop_requested or (lambda: False)
+    arm_ctrl.ctrl_dual_arm(arm_q, arm_tau)
+    for opening in (GRIPPER_OPEN, GRIPPER_CLOSED, GRIPPER_OPEN):
+        if should_stop():
+            return False
+        arm_ctrl.set_policy_gripper_q(opening, opening)
+        deadline = time.monotonic() + float(hold_seconds)
+        while time.monotonic() < deadline:
+            if should_stop():
+                return False
+            time.sleep(0.05)
+    return True
 
 
 def move_to_ready_pose(

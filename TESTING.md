@@ -584,7 +584,7 @@ INSTRUCTION="pick up the red cup" \
 
 | # | 操作 | 预期现象 | 这步在验什么 |
 |---|---|---|---|
-| 1 | 等日志 `Ready pose reached and held`，再终端按 `S` | 启动后双臂已在准备姿势；按 `S` 才进 `POLICY_LIVE` 并开始推理 | 抬手与推理分开：`startup --> READY_POSE --> POLICY_IDLE --S--> POLICY_LIVE` |
+| 1 | 等日志 `Ready pose reached and held`，再终端按 `S` | 夹爪先开合再停在张开，双臂再到准备姿势；按 `S` 才进 `POLICY_LIVE` | 抬手与推理分开，启动时夹爪张开 |
 | 2 | 终端按 `B` | policy 停，机械臂**倒放**最近约 3 秒；最后约 0.5 秒的路径会放慢停下，然后**停在回退终点不动、不抖** | 回退缓冲和末端减速；停住说明 hold 的是最后一拍命令而不是实测角 |
 | 3 | 看头显 | 出现 TARGET 坐标轴 | 回退终点经 FK 转成了 OpenXR TARGET |
 | 4 | 把手柄 RGB 轴对上 TARGET | 位置 ≤ 4 cm、旋转 ≤ 0.20 rad、稳 0.5 s 后提示 aligned | 对齐判据 |

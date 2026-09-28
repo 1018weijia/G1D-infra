@@ -8,8 +8,8 @@ from unittest import mock
 import numpy as np
 
 from teleop.utils.ready_pose import (
-    ARM_DIM, ReadyPoseError, load_ready_pose, move_to_ready_pose,
-    ready_pose_profile, smoothstep,
+    ARM_DIM, GRIPPER_CLOSED, GRIPPER_OPEN, ReadyPoseError, cycle_grippers_then_open,
+    load_ready_pose, move_to_ready_pose, ready_pose_profile, smoothstep,
 )
 
 
@@ -103,6 +103,27 @@ class ReadyPoseTests(unittest.TestCase):
         )
         self.assertFalse(result.completed)
         self.assertEqual(arm.commands, [])
+
+    @mock.patch("teleop.utils.ready_pose.time.sleep", return_value=None)
+    def test_gripper_cycle_ends_open(self, _sleep):
+        arm = _FakeArmController(np.zeros(ARM_DIM))
+        done = cycle_grippers_then_open(
+            arm, np.zeros(ARM_DIM), np.zeros(ARM_DIM), hold_seconds=0.05,
+        )
+        self.assertTrue(done)
+        self.assertEqual(arm.gripper_commands[0], (GRIPPER_OPEN, GRIPPER_OPEN))
+        self.assertIn((GRIPPER_CLOSED, GRIPPER_CLOSED), arm.gripper_commands)
+        self.assertEqual(arm.gripper_commands[-1], (GRIPPER_OPEN, GRIPPER_OPEN))
+
+    @mock.patch("teleop.utils.ready_pose.time.sleep", return_value=None)
+    def test_gripper_cycle_can_abort(self, _sleep):
+        arm = _FakeArmController(np.zeros(ARM_DIM))
+        done = cycle_grippers_then_open(
+            arm, np.zeros(ARM_DIM), np.zeros(ARM_DIM), hold_seconds=0.05,
+            stop_requested=lambda: True,
+        )
+        self.assertFalse(done)
+        self.assertEqual(arm.gripper_commands, [])
 
 
 if __name__ == "__main__":
