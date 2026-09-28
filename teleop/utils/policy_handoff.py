@@ -10,10 +10,12 @@ POLICY_LIVE = "POLICY_LIVE"
 POLICY_ROLLBACK = "POLICY_ROLLBACK"
 ALIGNING = "ALIGNING"
 TELEOP_LIVE = "TELEOP_LIVE"
+TELEOP_HOLD = "TELEOP_HOLD"
 
 TELEOP_PHASES = (TELEOP_LIVE,)
-RESUME_FROM_PHASES = (ALIGNING,) + TELEOP_PHASES
-ROLLBACK_FROM_PHASES = (POLICY_LIVE, TELEOP_LIVE)
+HOLD_FROM_PHASES = (TELEOP_LIVE,)
+RESUME_FROM_PHASES = (TELEOP_HOLD,)
+ROLLBACK_FROM_PHASES = (POLICY_LIVE, TELEOP_LIVE, TELEOP_HOLD)
 
 A_HANDOFF_DEBOUNCE_S = 0.5
 A_TELEOP_READY_DEBOUNCE_S = 0.2
@@ -21,6 +23,7 @@ A_GAP_S = 0.25
 
 START_POLICY = "start_policy"
 RESUME_POLICY = "resume_policy"
+HOLD_TELEOP = "hold_teleop"
 QUIT = "quit"
 ROLLBACK = "rollback"
 TAKEOVER = "takeover"
@@ -101,10 +104,11 @@ def interpret_key(key, phase, now, debounce_until, last_a_at, a_gap_s=A_GAP_S):
     """Map one stdin character to a control intent.
 
     Returns (action, last_a_at). last_a_at is updated for every 'a', including
-    ignored repeats, so a held key cannot both take over and immediately resume.
+    ignored repeats, so a held key cannot both take over and immediately hold.
     """
     if key == "s":
-        if phase in TELEOP_PHASES:
+        # Hold first, then S sends observation / resumes policy.
+        if phase in RESUME_FROM_PHASES:
             return RESUME_POLICY, last_a_at
         if phase in (POLICY_IDLE, ALIGNING):
             return START_POLICY, last_a_at
@@ -122,13 +126,13 @@ def interpret_key(key, phase, now, debounce_until, last_a_at, a_gap_s=A_GAP_S):
     last_a_at = now
     if phase == ALIGNING:
         return TAKEOVER, last_a_at
-    if phase not in TELEOP_PHASES:
+    if phase not in HOLD_FROM_PHASES:
         return IGNORE_A, last_a_at
     if now < debounce_until:
         return DEBOUNCE_A, last_a_at
     if gap < a_gap_s:
         return REPEAT_A, last_a_at
-    return RESUME_POLICY, last_a_at
+    return HOLD_TELEOP, last_a_at
 
 
 class ButtonRisingEdge:
@@ -144,17 +148,20 @@ class ButtonRisingEdge:
         return fired
 
 
-def stale_key_flags(phase, start_policy, resume_policy, align_confirm, rollback_request):
+def stale_key_flags(phase, start_policy, resume_policy, align_confirm, rollback_request,
+                    hold_teleop=False):
     """Drop latched keys that are not valid in the current phase."""
     if start_policy and phase not in (POLICY_IDLE, ALIGNING):
         start_policy = False
-    if resume_policy and phase not in TELEOP_PHASES:
+    if resume_policy and phase not in RESUME_FROM_PHASES:
         resume_policy = False
     if align_confirm and phase != ALIGNING:
         align_confirm = False
     if rollback_request and phase not in ROLLBACK_FROM_PHASES:
         rollback_request = False
-    return start_policy, resume_policy, align_confirm, rollback_request
+    if hold_teleop and phase not in HOLD_FROM_PHASES:
+        hold_teleop = False
+    return start_policy, resume_policy, align_confirm, rollback_request, hold_teleop
 
 
 def blend_should_finish(elapsed, duration, tracking_valid, ik_ok):

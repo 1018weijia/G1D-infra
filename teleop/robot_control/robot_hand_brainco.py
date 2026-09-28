@@ -36,10 +36,7 @@ class Brainco_Controller_ctrl:
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
 
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND)
-        else:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
+        self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND, unit_test=self.Unit_Test)
 
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicbraincoLeftCommand, MotorCmds_)
@@ -183,10 +180,7 @@ class Brainco_Controller_hand:
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
 
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND)
-        else:
-            self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND_Unit_Test)
+        self.hand_retargeting = HandRetargeting(HandType.BRAINCO_HAND, unit_test=self.Unit_Test)
 
         # initialize handcmd publisher and handstate subscriber
         self.LeftHandCmb_publisher = ChannelPublisher(kTopicbraincoLeftCommand, MotorCmds_)

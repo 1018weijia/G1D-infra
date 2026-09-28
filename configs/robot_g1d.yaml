@@ -1,0 +1,16 @@
+# Shared G1-D field defaults for scripts/run_collect.sh and scripts/run_deploy.sh.
+# Environment variables still override these values.
+
+image_host: "192.168.123.164"
+dds_interface: "eth0"
+
+task_dir: "/home/unitree/unitree_eai_environment/data/"
+task_name: "pick_place"
+task_goal: "pick and place"
+
+ready_pose_config: "configs/ready_pose.json"
+alignment_targets: "configs/alignment_targets.json"
+
+local_policy_host: "127.0.0.1"
+local_policy_port: 15555
+policy_protocol: "zmq"

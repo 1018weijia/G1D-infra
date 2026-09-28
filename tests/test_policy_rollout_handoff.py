@@ -10,6 +10,7 @@ from teleop.utils.policy_handoff import (
     A_GAP_S,
     ALIGNING,
     DEBOUNCE_A,
+    HOLD_TELEOP,
     IGNORE_A,
     NONE,
     POLICY_IDLE,
@@ -20,6 +21,7 @@ from teleop.utils.policy_handoff import (
     ROLLBACK,
     START_POLICY,
     TAKEOVER,
+    TELEOP_HOLD,
     TELEOP_LIVE,
     ButtonRisingEdge,
     blend_should_finish,
@@ -129,11 +131,12 @@ class PolicyHandoffKeyTests(unittest.TestCase):
     def test_s_starts_only_from_idle_or_aligning(self):
         self.assertEqual(interpret_key("s", POLICY_IDLE, 1.0, 0.0, 0.0)[0], START_POLICY)
         self.assertEqual(interpret_key("s", ALIGNING, 1.0, 0.0, 0.0)[0], START_POLICY)
-        self.assertEqual(interpret_key("s", TELEOP_LIVE, 1.0, 0.0, 0.0)[0], RESUME_POLICY)
+        self.assertEqual(interpret_key("s", TELEOP_HOLD, 1.0, 0.0, 0.0)[0], RESUME_POLICY)
+        self.assertEqual(interpret_key("s", TELEOP_LIVE, 1.0, 0.0, 0.0)[0], NONE)
         self.assertEqual(interpret_key("s", POLICY_LIVE, 1.0, 0.0, 0.0)[0], NONE)
         self.assertEqual(interpret_key("s", POLICY_ROLLBACK, 1.0, 0.0, 0.0)[0], NONE)
 
-    def test_a_takeover_then_held_repeat_does_not_resume(self):
+    def test_a_takeover_then_held_repeat_does_not_hold(self):
         first, last_a = interpret_key("a", ALIGNING, 10.0, 0.0, 0.0)
         self.assertEqual(first, TAKEOVER)
         debounce_until = last_a + 0.5
@@ -146,25 +149,39 @@ class PolicyHandoffKeyTests(unittest.TestCase):
         released, _ = interpret_key(
             "a", TELEOP_LIVE, last_a + A_GAP_S, debounce_until, last_a
         )
-        self.assertEqual(released, RESUME_POLICY)
+        self.assertEqual(released, HOLD_TELEOP)
 
     def test_a_ignored_until_rollback(self):
         self.assertEqual(interpret_key("a", POLICY_LIVE, 1.0, 0.0, 0.0)[0], IGNORE_A)
         self.assertEqual(interpret_key("a", POLICY_IDLE, 1.0, 0.0, 0.0)[0], IGNORE_A)
+        self.assertEqual(interpret_key("a", TELEOP_HOLD, 1.0, 0.0, 0.0)[0], IGNORE_A)
 
     def test_b_allowed_during_policy_and_teleop(self):
         self.assertEqual(interpret_key("b", POLICY_LIVE, 1.0, 0.0, 0.0)[0], ROLLBACK)
         self.assertEqual(interpret_key("b", TELEOP_LIVE, 1.0, 0.0, 0.0)[0], ROLLBACK)
+        self.assertEqual(interpret_key("b", TELEOP_HOLD, 1.0, 0.0, 0.0)[0], ROLLBACK)
         self.assertEqual(interpret_key("b", ALIGNING, 1.0, 0.0, 0.0)[0], NONE)
 
     def test_stale_start_policy_is_dropped_in_live_policy(self):
-        start, resume, confirm, rollback = stale_key_flags(
-            POLICY_LIVE, True, True, True, False,
+        start, resume, confirm, rollback, hold = stale_key_flags(
+            POLICY_LIVE, True, True, True, False, True,
         )
         self.assertFalse(start)
         self.assertFalse(resume)
         self.assertFalse(confirm)
         self.assertFalse(rollback)
+        self.assertFalse(hold)
+
+    def test_resume_only_valid_from_teleop_hold(self):
+        _, resume, _, _, _ = stale_key_flags(
+            TELEOP_HOLD, False, True, False, False, False,
+        )
+        self.assertTrue(resume)
+        _, resume, _, _, hold = stale_key_flags(
+            TELEOP_LIVE, False, True, False, False, True,
+        )
+        self.assertFalse(resume)
+        self.assertTrue(hold)
 
     def test_blend_finish_requires_tracking_and_ik(self):
         self.assertFalse(blend_should_finish(0.3, 0.3, False, True))

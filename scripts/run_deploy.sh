@@ -3,6 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=lib/load_robot_config.sh
+source "$SCRIPT_DIR/lib/load_robot_config.sh"
+g1d_load_robot_config
 
 SSH_HOST="${SSH_HOST:-}"
 SSH_PORT="${SSH_PORT:-22}"
@@ -10,14 +13,15 @@ SSH_USER="${SSH_USER:-root}"
 SSH_KEY="${SSH_KEY:-}"
 REMOTE_POLICY_HOST="${REMOTE_POLICY_HOST:-}"
 REMOTE_POLICY_PORT="${REMOTE_POLICY_PORT:-5555}"
-LOCAL_POLICY_HOST="${LOCAL_POLICY_HOST:-127.0.0.1}"
-LOCAL_POLICY_PORT="${LOCAL_POLICY_PORT:-15555}"
-POLICY_PROTOCOL="${POLICY_PROTOCOL:-zmq}"
-IMAGE_HOST="${IMAGE_HOST:-192.168.123.164}"
-DDS_INTERFACE="${UNITREE_DDSINTERFACE:-eth0}"
+LOCAL_POLICY_HOST="${LOCAL_POLICY_HOST:-$G1D_LOCAL_POLICY_HOST}"
+LOCAL_POLICY_PORT="${LOCAL_POLICY_PORT:-$G1D_LOCAL_POLICY_PORT}"
+POLICY_PROTOCOL="${POLICY_PROTOCOL:-$G1D_POLICY_PROTOCOL}"
+IMAGE_HOST="${IMAGE_HOST:-$G1D_IMAGE_HOST}"
+DDS_INTERFACE="${UNITREE_DDSINTERFACE:-${DDS_INTERFACE:-$G1D_DDS_INTERFACE}}"
 CONFIG_PATH="${CONFIG_PATH:-$REPO_ROOT/configs/infer_g1d.yaml}"
-READY_POSE_CONFIG="${READY_POSE_CONFIG:-$REPO_ROOT/configs/ready_pose.json}"
+READY_POSE_CONFIG="${READY_POSE_CONFIG:-$G1D_READY_POSE_CONFIG}"
 READY_POSE_SECONDS="${READY_POSE_SECONDS:-3.0}"
+ALIGNMENT_TARGET_CONFIG="${ALIGNMENT_TARGET_CONFIG:-$G1D_ALIGNMENT_TARGETS}"
 INSTRUCTION="${INSTRUCTION:-}"
 ACTION_INTERP_FACTOR="${ACTION_INTERP_FACTOR:-1}"
 EXEC_CHUNK_STEPS="${EXEC_CHUNK_STEPS:-0}"
@@ -55,6 +59,7 @@ if (( DRY_RUN == 1 )); then
   echo "[launcher] input-mode: $INPUT_MODE"
   echo "[launcher] config: $CONFIG_PATH"
   echo "[launcher] ready pose: $READY_POSE_CONFIG (${READY_POSE_SECONDS}s)"
+  echo "[launcher] alignment: $ALIGNMENT_TARGET_CONFIG"
   echo "[launcher] image:  $IMAGE_HOST"
   echo "[launcher] instruction: ${INSTRUCTION:-<unset>}"
   exit 0
@@ -77,12 +82,18 @@ fi
 
 policy_tunnel_start
 
+if ! bash "$SCRIPT_DIR/wait_policy.sh" "$LOCAL_POLICY_HOST" "$LOCAL_POLICY_PORT" "$POLICY_PROTOCOL"; then
+  echo "[launcher] Policy probe failed; not starting policy_deploy.py." >&2
+  exit 1
+fi
+
 cd "$REPO_ROOT"
 export UNITREE_DDSINTERFACE="$DDS_INTERFACE"
 python policy_deploy.py \
   --config-path "$CONFIG_PATH" \
   --ready-pose-config "$READY_POSE_CONFIG" \
   --ready-pose-seconds "$READY_POSE_SECONDS" \
+  --alignment-target-config "$ALIGNMENT_TARGET_CONFIG" \
   --instruction "$INSTRUCTION" \
   --server-host "$LOCAL_POLICY_HOST" \
   --server-port "$LOCAL_POLICY_PORT" \

@@ -31,10 +31,12 @@ from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
 from teleop.teleimager.src.teleimager.image_client import ImageClient
 from teleop.utils.alignment import ACTIVE, ALIGNED, DualArmAlignment
 from teleop.utils.alignment_config import load_targets
+from teleop.utils.arm_owner_lock import ArmOwnerLockError, acquire_arm_owner_lock
 from teleop.utils.dex1_arm_bundle import create_dex1_arm_controller
 from teleop.utils.ego_projection import EgoPixelOverlay
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.handoff_utils import rollback_endpoint_to_xr_targets
+from teleop.utils.intervention_log import InterventionLogger
 from teleop.utils.policy_client import PolicyAdapter, PolicyRemoteClient
 from teleop.utils.policy_handoff import (
     A_GAP_S,
@@ -42,6 +44,7 @@ from teleop.utils.policy_handoff import (
     A_TELEOP_READY_DEBOUNCE_S,
     ALIGNING,
     DEBOUNCE_A,
+    HOLD_TELEOP as HOLD_TELEOP_ACTION,
     IGNORE_A,
     NONE,
     POLICY_IDLE,
@@ -54,6 +57,7 @@ from teleop.utils.policy_handoff import (
     ROLLBACK_FROM_PHASES,
     START_POLICY as START_POLICY_ACTION,
     TAKEOVER,
+    TELEOP_HOLD,
     TELEOP_LIVE,
     alignment_state_code,
     blend_should_finish,
@@ -82,6 +86,8 @@ START_POLICY = False
 ROLLBACK_REQUEST = False
 ALIGN_CONFIRM = False
 RESUME_POLICY = False
+HOLD_TELEOP = False
+FAIL_RECORD = False
 RUN_PHASE = POLICY_IDLE
 ALIGNMENT_STATE = None
 A_LAST_CHAR_AT = 0.0
@@ -91,7 +97,11 @@ KEY_LISTENER_STOP = threading.Event()
 
 def on_press(key):
     global STOP, START_POLICY, ROLLBACK_REQUEST, ALIGN_CONFIRM, RESUME_POLICY
-    global RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT
+    global HOLD_TELEOP, FAIL_RECORD, RUN_PHASE, ALIGNMENT_STATE, A_LAST_CHAR_AT
+    if key == "f":
+        FAIL_RECORD = True
+        logger_mp.info("[on_press] F: mark current recorded episode as FAILED.")
+        return
     action, A_LAST_CHAR_AT = interpret_key(
         key, RUN_PHASE, time.monotonic(), A_DEBOUNCE_UNTIL, A_LAST_CHAR_AT, A_GAP_S,
     )
@@ -99,7 +109,16 @@ def on_press(key):
         START_POLICY = True
     elif action == RESUME_POLICY_ACTION:
         RESUME_POLICY = True
-        logger_mp.info("[on_press] %s: return control to policy (phase=%s).", key.upper(), RUN_PHASE)
+        logger_mp.info(
+            "[on_press] %s: resume policy from held pose (phase=%s).",
+            key.upper(), RUN_PHASE,
+        )
+    elif action == HOLD_TELEOP_ACTION:
+        HOLD_TELEOP = True
+        logger_mp.info(
+            "[on_press] %s: exit teleop and hold current pose (phase=%s).",
+            key.upper(), RUN_PHASE,
+        )
     elif action == QUIT:
         STOP = True
     elif action == ROLLBACK:
@@ -123,7 +142,7 @@ def on_press(key):
     elif action == REPEAT_A:
         return
     elif action == NONE:
-        if key not in ("s", "b"):
+        if key not in ("s", "b", "f"):
             logger_mp.warning("[on_press] %s was pressed, but no action is defined for this key.", key)
 
 
@@ -248,13 +267,25 @@ def _split_head_colors(head_img, camera_config):
     return colors
 
 
-def _start_record_episode(args, recorder, recording):
+def _start_record_episode(args, recorder, recording, intervention_log=None):
     if recorder is None or recording:
         return recording
     if recorder.create_episode():
         logger_mp.info("Recording policy episode to %s", recorder.episode_dir)
+        if intervention_log is not None:
+            intervention_log.bind(recorder.episode_dir)
         return True
     logger_mp.error("Failed to create record episode.")
+    return False
+
+
+def _finish_record_episode(recorder, recording, success, intervention_log=None):
+    """Save the open episode; returns False once recording is closed."""
+    if recorder is None or not recording:
+        return False
+    recorder.save_episode(success=success)
+    if intervention_log is not None:
+        intervention_log.clear()
     return False
 
 
@@ -338,11 +369,23 @@ if __name__ == "__main__":
     parser.add_argument("--task-goal", type=str, default="")
     parser.add_argument("--task-desc", type=str, default="policy rollout with rollback handoff")
     parser.add_argument("--task-steps", type=str, default="")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Bypass arm-owner lock (dangerous if collect/deploy already running)",
+    )
     args = parser.parse_args()
     if args.record and not args.task_goal:
         args.task_goal = args.instruction
     if args.alignment_target_config and not os.path.isfile(args.alignment_target_config):
         args.alignment_target_config = None
+
+    arm_lock = None
+    if not args.force:
+        try:
+            arm_lock = acquire_arm_owner_lock("deploy")
+        except ArmOwnerLockError as lock_error:
+            logger_mp.error("%s", lock_error)
+            sys.exit(1)
 
     if args.alignment_handoff_seconds < 0.0:
         parser.error("--alignment-handoff-seconds must be non-negative")
@@ -386,6 +429,8 @@ if __name__ == "__main__":
     arm_ctrl = None
     recorder = None
     recording = False
+    episode_success = True
+    intervention_log = InterventionLogger()
     inference_thread = None
     inference_stop = False
     try:
@@ -456,6 +501,7 @@ if __name__ == "__main__":
         )
         rollback_buffer = PolicyRollbackBuffer(args.rollback_seconds, args.frequency)
         gamepad_a = ButtonRisingEdge()
+        gamepad_fail = ButtonRisingEdge()
 
         ego_overlay = None
         if args.ego_pixel_overlay:
@@ -568,7 +614,10 @@ if __name__ == "__main__":
             last_right_grip = resume_right_grip
             clear_handoff_runtime()
             RUN_PHASE = POLICY_LIVE
-            recording = _start_record_episode(args, recorder, recording)
+            recording = _start_record_episode(
+                args, recorder, recording, intervention_log=intervention_log,
+            )
+            intervention_log.log("policy_resume", phase=RUN_PHASE)
             logger_mp.info("Policy resumed from %s; waiting for chunk.", from_label)
             return True
 
@@ -598,7 +647,9 @@ if __name__ == "__main__":
             START_POLICY = False
             logger_mp.info(
                 "Ready pose reached and held. Press keyboard S to start inference. "
-                "B=rollback, gamepad A=take over, gamepad A again (or S)=return policy, Q=quit."
+                "B=rollback, gamepad A=take over, gamepad A again=hold teleop, "
+                "keyboard S from hold=resume policy, "
+                "F/left-X=fail-stop recorded episode, Q=quit."
             )
 
         while not STOP:
@@ -610,6 +661,18 @@ if __name__ == "__main__":
             tele_data = tv_wrapper.get_tele_data()
             if gamepad_a.update(getattr(tele_data, "right_ctrl_aButton", False)):
                 on_press("a")
+            if gamepad_fail.update(getattr(tele_data, "left_ctrl_aButton", False)):
+                on_press("f")
+            if FAIL_RECORD and recording:
+                FAIL_RECORD = False
+                episode_success = False
+                recording = _finish_record_episode(
+                    recorder, recording, success=False, intervention_log=intervention_log,
+                )
+                logger_mp.info("Recorded episode marked FAILED and closed.")
+            elif FAIL_RECORD:
+                FAIL_RECORD = False
+                logger_mp.warning("F ignored: no running recorded episode.")
             aligned_left_pose = tele_data.left_wrist_pose_openxr
             aligned_right_pose = tele_data.right_wrist_pose_openxr
             if args.alignment_forward_offset:
@@ -629,12 +692,15 @@ if __name__ == "__main__":
                 xr_motion_data_ready.value = tele_data.motion_data_ready
             tracking_valid = is_tracking_valid(tele_data)
             blending = RUN_PHASE == TELEOP_LIVE and is_blending(handoff)
-            if RUN_PHASE == TELEOP_LIVE and not blending:
+            if RUN_PHASE == TELEOP_LIVE and not blending and not HOLD_TELEOP:
                 _write_xr_grippers(
                     left_gripper_value, right_gripper_value, tele_data, args.input_mode
                 )
-            START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST = stale_key_flags(
-                RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST,
+            START_POLICY, RESUME_POLICY, ALIGN_CONFIRM, ROLLBACK_REQUEST, HOLD_TELEOP = (
+                stale_key_flags(
+                    RUN_PHASE, START_POLICY, RESUME_POLICY, ALIGN_CONFIRM,
+                    ROLLBACK_REQUEST, HOLD_TELEOP,
+                )
             )
 
             if START_POLICY and RUN_PHASE == POLICY_IDLE:
@@ -643,14 +709,34 @@ if __name__ == "__main__":
                 prefetched_queue = []
                 policy_inference_enabled = True
                 RUN_PHASE = POLICY_LIVE
-                recording = _start_record_episode(args, recorder, recording)
+                episode_success = True
+                recording = _start_record_episode(
+                    args, recorder, recording, intervention_log=intervention_log,
+                )
                 logger_mp.info(
                     "Policy rollout started from the ready pose and is requesting the first chunk."
                 )
 
+            if HOLD_TELEOP and RUN_PHASE == TELEOP_LIVE:
+                HOLD_TELEOP = False
+                freeze_left, freeze_right = arm_ctrl.latch_gripper_command()
+                hold_q, hold_tau, hold_left, hold_right = rollback_hold_from_last_command(
+                    last_arm_q, last_tau, freeze_left, freeze_right,
+                )
+                handoff["hold_q"] = hold_q
+                handoff["hold_tau"] = hold_tau
+                handoff["hold_grip"] = np.array([hold_left, hold_right], dtype=float)
+                handoff["blend_started"] = None
+                RUN_PHASE = TELEOP_HOLD
+                intervention_log.log("teleop_hold", phase=RUN_PHASE)
+                logger_mp.info(
+                    "Teleop held at current pose. Press keyboard S to send observation "
+                    "and resume policy, or B to rollback."
+                )
+
             if ((START_POLICY and RUN_PHASE == ALIGNING) or
-                    (RESUME_POLICY and RUN_PHASE == TELEOP_LIVE)):
-                from_label = "alignment pose" if RUN_PHASE == ALIGNING else "teleop pose"
+                    (RESUME_POLICY and RUN_PHASE == TELEOP_HOLD)):
+                from_label = "alignment pose" if RUN_PHASE == ALIGNING else "held teleop pose"
                 try:
                     if try_resume_policy(from_label):
                         START_POLICY = False
@@ -672,6 +758,7 @@ if __name__ == "__main__":
                 ease_steps = max(2, int(round(ROLLBACK_EASE_SECONDS * args.frequency)))
                 rollback_sequence = ease_out_playback(raw_rollback, ease_steps)
                 RUN_PHASE = POLICY_ROLLBACK
+                intervention_log.log("rollback_start", phase=RUN_PHASE)
                 logger_mp.info(
                     "Rollback requested: replaying %d frames; slowing the last %.2fs of the path to a stop",
                     len(rollback_sequence),
@@ -719,6 +806,7 @@ if __name__ == "__main__":
                 alignment_state_shared[0] = alignment_state_code(alignment.state)
                 alignment_log_time = 0.0
                 RUN_PHASE = ALIGNING
+                intervention_log.log("align_start", phase=RUN_PHASE)
 
             current_lr_arm_q = arm_ctrl.get_current_dual_arm_q()[:14]
             sol_q = last_arm_q.copy()
@@ -781,7 +869,10 @@ if __name__ == "__main__":
                 cmd_left_grip, cmd_right_grip = hold_gripper_cmd(
                     handoff["hold_grip"], last_left_grip, last_right_grip
                 )
+                prev_align_state = alignment.state
                 alignment.update(aligned_left_pose, aligned_right_pose, tracking_valid)
+                if prev_align_state != ALIGNED and alignment.state == ALIGNED:
+                    intervention_log.log("align_ok", phase=RUN_PHASE)
                 if tracking_valid:
                     tv_wrapper.set_alignment_current_targets(
                         aligned_left_pose, aligned_right_pose
@@ -856,8 +947,16 @@ if __name__ == "__main__":
                         RUN_PHASE = TELEOP_LIVE
                         blending = True
                         A_DEBOUNCE_UNTIL = time.monotonic() + A_HANDOFF_DEBOUNCE_S
+                        intervention_log.log(
+                            "teleop_enter",
+                            phase=RUN_PHASE,
+                            forced=not was_aligned,
+                        )
+                        if was_aligned:
+                            intervention_log.log("align_ok", phase=RUN_PHASE)
                         logger_mp.info(
-                            "Handoff confirmed. Release gamepad A, then press it again after teleop is active to return policy."
+                            "Handoff confirmed. Release gamepad A, then press it again after "
+                            "teleop is active to hold; press keyboard S to resume policy."
                         )
                 ALIGNMENT_STATE = alignment.state
                 alignment_state_shared[0] = alignment_state_code(alignment.state)
@@ -892,6 +991,15 @@ if __name__ == "__main__":
                     cmd_left_grip, cmd_right_grip = hold_gripper_cmd(
                         handoff["hold_grip"], last_left_grip, last_right_grip
                     )
+                else:
+                    cmd_left_grip, cmd_right_grip = _read_grippers(arm_ctrl)
+
+            elif RUN_PHASE == TELEOP_HOLD:
+                sol_q = hold_arm_cmd(handoff["hold_q"], last_arm_q)
+                sol_tauff = hold_tau_cmd(handoff["hold_tau"], last_tau)
+                cmd_left_grip, cmd_right_grip = hold_gripper_cmd(
+                    handoff["hold_grip"], last_left_grip, last_right_grip
+                )
 
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
             blending = RUN_PHASE == TELEOP_LIVE and is_blending(handoff)
@@ -928,16 +1036,13 @@ if __name__ == "__main__":
                     A_DEBOUNCE_UNTIL = max(
                         A_DEBOUNCE_UNTIL, time.monotonic() + A_TELEOP_READY_DEBOUNCE_S
                     )
-                    logger_mp.info("Teleoperation handoff active. Press gamepad A again to return control to policy.")
+                    logger_mp.info(
+                        "Teleoperation handoff active. Press gamepad A to hold, "
+                        "then keyboard S to resume policy."
+                    )
 
-            if RUN_PHASE == POLICY_LIVE:
+            if RUN_PHASE in (POLICY_LIVE, TELEOP_LIVE, TELEOP_HOLD):
                 rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
-            elif RUN_PHASE == TELEOP_LIVE:
-                if blending:
-                    rollback_buffer.append(sol_q[:14], sol_tauff[:14], cmd_left_grip, cmd_right_grip)
-                else:
-                    tele_left_grip, tele_right_grip = _read_grippers(arm_ctrl)
-                    rollback_buffer.append(sol_q[:14], sol_tauff[:14], tele_left_grip, tele_right_grip)
 
             last_arm_q = np.asarray(sol_q[:14], dtype=float).copy()
             last_tau = np.asarray(sol_tauff[:14], dtype=float).copy()
@@ -1008,10 +1113,15 @@ if __name__ == "__main__":
         if recorder is not None:
             try:
                 if recording:
-                    recorder.save_episode(success=True)
+                    recording = _finish_record_episode(
+                        recorder, recording, success=episode_success,
+                        intervention_log=intervention_log,
+                    )
                 recorder.close()
             except Exception as record_error:
                 logger_mp.error("Failed to close recorder: %s", record_error)
         if img_client is not None:
             img_client.close()
+        if arm_lock is not None:
+            arm_lock.release()
         logger_mp.info("Policy rollout handoff exited.")

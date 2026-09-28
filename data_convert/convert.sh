@@ -2,12 +2,11 @@
 # Convert a Unitree JSON dataset (episode_XXXX/data.json) to LeRobot v3.0.
 #
 # Usage:
-#   ./convert.sh
 #   ./convert.sh --raw-dir ~/unitree_eai_environment/data/pick_place_100 \
 #                --output-dir ~/g1d_infra/datasets/pick_place_100
-#   ./convert.sh --bad 7,15,23
-#   ./convert.sh --skip-bad          # drop bad episodes instead of tagging them
-#   ./convert.sh --no-auto-bad       # ignore FAILED markers, trust the list only
+#   ./convert.sh --raw-dir ... --output-dir ... --bad 7,15,23
+#   ./convert.sh --raw-dir ... --output-dir ... --skip-bad
+#   ./convert.sh --raw-dir ... --output-dir ... --no-auto-bad
 #
 # Episodes that collect.py already labelled failed (a FAILED marker file, or
 # "success": false in data.json) are detected automatically. BAD_EPISODES and
@@ -25,8 +24,8 @@ set -euo pipefail
 # =============================================================================
 BAD_EPISODES=""
 
-INPUT="${HOME}/unitree_eai_environment/data/pick_place_100"
-OUTPUT="${HOME}/g1d_infra/datasets/pick_place_100"
+INPUT=""
+OUTPUT=""
 ROBOT_TYPE="Unitree_G1_MoveibleLift_Dex1_NoUseWaist"
 TASK=""
 SKIP_BAD=0
@@ -198,6 +197,12 @@ done
 
 INPUT="${INPUT/#\~/${HOME}}"
 OUTPUT="${OUTPUT/#\~/${HOME}}"
+
+if [[ -z "${INPUT}" || -z "${OUTPUT}" ]]; then
+  echo "Both --raw-dir and --output-dir are required." >&2
+  usage >&2
+  exit 1
+fi
 
 if [[ ! -d "${INPUT}" ]]; then
   echo "Input directory not found: ${INPUT}" >&2

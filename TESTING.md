@@ -67,7 +67,7 @@ python tests/check_env.py
 
 ## L1 单元测试
 
-89 个无硬件依赖的用例，覆盖准备姿势、对齐状态机、回退缓冲、接管按键防抖、episode 失败标记与坏轨迹识别、录制写盘吞吐、轨迹重放校验、动作 chunk 校验。
+无硬件依赖的用例，覆盖准备姿势、对齐状态机、回退缓冲、接管按键防抖、episode 失败标记与坏轨迹识别、录制写盘吞吐、轨迹重放校验、动作 chunk 校验、arm owner lock、intervention 日志。
 
 ```bash
 cd ~/g1d_infra
@@ -92,7 +92,7 @@ OK
 |---|---|
 | `test_rollback_hold_uses_last_command_not_measured_state` | 回退播完后 hold 的是最后一拍命令，不是实测关节角。挂了会导致机械臂从回退终点抽回去 |
 | `test_move_commands_target_and_preserves_grippers` | 准备段准确到达抬手姿势，并且不会误开合夹爪 |
-| `test_a_takeover_then_held_repeat_does_not_resume` | 按住 A 不会被当成「接管 + 立刻交回」 |
+| `test_a_takeover_then_held_repeat_does_not_hold` | 按住 A 不会被当成「接管 + 立刻 hold」 |
 | `test_a_ignored_until_rollback` | 没回退就按 A 不接管 |
 | `test_tracking_loss_holds_and_reanchor_restarts_blend` | tracking 掉了保持不动，恢复后重新 blend |
 | `test_validate_rejects_bad_chunk` | 越界或含 NaN 的动作 chunk 不下发 |
@@ -580,7 +580,7 @@ INSTRUCTION="pick up the red cup" \
 
 ### L5.2 状态机全流程
 
-**回退 `B` 来自 ssh 终端键盘。接管和交回来自右手柄 `A`。** 终端 `S` / `Q` 仍在键盘上；终端 `A` 只是等效备用。
+**回退 `B` 来自 ssh 终端键盘。接管与 hold 来自右手柄 `A`；从 hold 恢复 Policy 用终端 `S`。** 终端 `Q` 仍在键盘上；终端 `A` 只是等效备用。
 
 | # | 操作 | 预期现象 | 这步在验什么 |
 |---|---|---|---|
@@ -590,16 +590,18 @@ INSTRUCTION="pick up the red cup" \
 | 4 | 把手柄 RGB 轴对上 TARGET | 位置 ≤ 4 cm、旋转 ≤ 0.20 rad、稳 0.5 s 后提示 aligned | 对齐判据 |
 | 5 | 按右手柄 `A` | 进 `TELEOP_LIVE`，机械臂跟手；前若干秒增益从 0 渐升，**不会猛冲** | 相对接管 + blend |
 | 6 | 松开手柄 A，等 `Teleoperation handoff active` | 打印该日志 | 防抖窗口结束 |
-| 7 | 再按一次右手柄 `A`（或终端 `S`） | 从当前遥操作姿态交回 policy，**不需要重新对齐** | 交回路径 |
-| 8 | 重复 2–7 一次 | 行为一致 | 状态机可复用，无残留 |
-| 9 | 在 `TELEOP_LIVE` 里终端按 `B` | 照样进回退 | blend 期间也能中止 |
-| 10 | 终端按 `Q` | 干净退出，隧道关闭 | `cleanup` trap |
+| 7 | 再按一次右手柄 `A` | 进 `TELEOP_HOLD`，手臂和夹爪停住且不松开，不发观测 | 先 hold |
+| 8 | 终端按 `S` | 从 hold 姿态发观测并恢复 policy，**不需要重新对齐** | 再 resume |
+| 9 | 重复 2–8 一次 | 行为一致 | 状态机可复用，无残留 |
+| 10 | 在 `TELEOP_LIVE` / `TELEOP_HOLD` 里终端按 `B` | 照样进回退 | blend / hold 期间也能中止 |
+| 11 | 终端按 `Q` | 干净退出，隧道关闭 | `cleanup` trap |
 
 **整体成功标志**：10 步全过，且全程没有出现——
 
 - 回退末端还在抖，或播完后机械臂往回抽（第 2 步是核心回归点，对应 L1 的 `test_rollback_hold_uses_last_command_not_measured_state` 和 `test_ease_out_stops_on_the_recorded_endpoint`）。
 - 第一次按手柄 `A` 后机械臂突然加速（blend 没生效）。
-- 按住手柄 `A` 被识别成「接管 + 立刻交回」（松开再按才算第二次）。
+- 按住手柄 `A` 被识别成「接管 + 立刻 hold」（松开再按才算第二次）。
+- 第二次 `A` 后夹爪松开、跟着动，或立刻发观测（应先 hold，再按终端 `S`）。
 - 退出后 `15555` 端口还占着：`ss -ltn | grep 15555` 应该没输出。
 
 ### L5.3 tracking 丢失

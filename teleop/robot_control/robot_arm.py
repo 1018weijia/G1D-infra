@@ -505,21 +505,17 @@ class G1_29_Arm_Internal_Dex1_Controller:
                 cliped_q_target = self.clip_arm_q_target(q_target, velocity_limit=self.arm_velocity_limit)
 
             gripper_state = self.get_current_dual_gripper_q()
-            if self._policy_gripper_direct:
-                with self.ctrl_lock:
-                    gripper_q_target = self.gripper_q_target.copy()
-            elif xr_motion_data_ready:
-                left_target_action = np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX])
-                right_target_action = np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX])
-                with self.ctrl_lock:
-                    self.gripper_q_target = np.array([left_target_action, right_target_action])
-                with self.ctrl_lock:
-                    gripper_q_target = self.gripper_q_target.copy()
+            if xr_motion_data_ready:
+                new_target = np.array([
+                    np.interp(left_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [LEFT_MAPPED_MIN, LEFT_MAPPED_MAX]),
+                    np.interp(right_gripper_value, [THUMB_INDEX_DISTANCE_MIN, THUMB_INDEX_DISTANCE_MAX], [RIGHT_MAPPED_MIN, RIGHT_MAPPED_MAX]),
+                ], dtype=float)
             else:
-                with self.ctrl_lock:
-                    self.gripper_q_target = gripper_state.copy()
-                with self.ctrl_lock:
-                    gripper_q_target = self.gripper_q_target.copy()
+                new_target = np.asarray(gripper_state, dtype=float).copy()
+            with self.ctrl_lock:
+                if not self._policy_gripper_direct:
+                    self.gripper_q_target = new_target
+                gripper_q_target = self.gripper_q_target.copy()
             gripper_q_cmd = np.clip(gripper_q_target, gripper_state - DELTA_GRIPPER_CMD, gripper_state + DELTA_GRIPPER_CMD)
 
             if self.smooth_filter:
@@ -568,7 +564,15 @@ class G1_29_Arm_Internal_Dex1_Controller:
 
     def clear_policy_gripper_direct(self):
         """Return gripper control to XR/controller mapping."""
-        self._policy_gripper_direct = False
+        with self.ctrl_lock:
+            self._policy_gripper_direct = False
+
+    def latch_gripper_command(self):
+        """Keep the current gripper command and ignore XR."""
+        with self.ctrl_lock:
+            self._policy_gripper_direct = True
+            target = np.asarray(self.gripper_q_target, dtype=float).copy()
+        return float(target[0]), float(target[1])
 
     def ctrl_dual_arm(self, q_target, tauff_target):
         q_arr = np.atleast_1d(q_target)

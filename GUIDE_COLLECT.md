@@ -2,12 +2,16 @@
 
 `collect.py` 只做 XR 遥操作录制。没有 policy、没有回退、没有接管。
 
+**支持矩阵**：G1-D + Dex1 internal + controller/hand。其它末端不再从入口接入。
+
 ## 启动
 
 ```bash
 cd ~/g1d_infra
 ./scripts/run_collect.sh
 ```
+
+默认从 [`configs/robot_g1d.yaml`](configs/robot_g1d.yaml) 读取 `image_host` / `dds_interface` / task 默认值；环境变量仍可覆盖。
 
 等价于：
 
@@ -25,9 +29,9 @@ UNITREE_DDSINTERFACE=eth0 python collect.py \
 
 Rerun 可视化默认关闭，要用加 `--rerun`，且机器上得有 `DISPLAY`。它会在每次开始录制时阻塞主循环约 3.7 秒（机械臂会跳变），每帧再多花约 12 毫秒；没有显示器时自动忽略。
 
-环境变量：`EE`、`INPUT_MODE`、`TASK_DIR`、`TASK_NAME`、`TASK_GOAL`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`。
+环境变量：`INPUT_MODE`、`TASK_DIR`、`TASK_NAME`、`TASK_GOAL`、`IMAGE_HOST`、`UNITREE_DDSINTERFACE`、`ROBOT_CONFIG`。
 
-启动前不要同时跑其他机械臂控制程序。图像服务需已在 `192.168.123.164`（可用 `IMAGE_HOST` 覆盖）。
+启动前不要同时跑其他机械臂控制程序（与 `policy_deploy` 共享 `/tmp/g1d_arm_owner.lock`）。图像服务需已在 `192.168.123.164`（可用 `IMAGE_HOST` 覆盖）。
 
 ## 手柄按键
 
@@ -57,6 +61,14 @@ Rerun 可视化默认关闭，要用加 `--rerun`，且机器上得有 `DISPLAY`
 
 ## 之后
 
+先做本地摘要（可选）：
+
+```bash
+python scripts/episode_summary.py ~/unitree_eai_environment/data/pick_place
+```
+
+再转换上传：
+
 ```bash
 cd ~/g1d_infra/data_convert
 ./convert.sh --raw-dir ~/unitree_eai_environment/data/pick_place \
@@ -65,3 +77,5 @@ cd ~/g1d_infra/data_convert
 ./upload.sh --token "$MODELSCOPE_API_TOKEN" --repo owner/pick_place \
             --local-dir ~/g1d_infra/datasets/pick_place
 ```
+
+`--raw-dir` 与 `--output-dir` 为必填。

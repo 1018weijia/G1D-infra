@@ -67,10 +67,7 @@ class Inspire_Controller_DFX:
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND)
-        else:
-            self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND_Unit_Test)
+        self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND, unit_test=self.Unit_Test)
 
         # initialize handcmd publisher and handstate subscriber
         self.HandCmb_publisher = ChannelPublisher(kTopicInspireDFXCommand, MotorCmds_)
@@ -328,10 +325,7 @@ class Inspire_Controller_FTP:
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND)
-        else:
-            self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND_Unit_Test)
+        self.hand_retargeting = HandRetargeting(HandType.INSPIRE_HAND, unit_test=self.Unit_Test)
 
         # Initialize hand command publishers
         self.LeftHandCmd_publisher = ChannelPublisher(kTopicInspireFTPLeftCommand, inspire_dds.inspire_hand_ctrl)

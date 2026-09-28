@@ -10,7 +10,6 @@ logging_mp.basicConfig(level=logging_mp.INFO,
 logger_mp = logging_mp.getLogger(__name__)
 import time
 import argparse
-from multiprocessing import Value, Array, Lock
 import threading
 import numpy as np
 import os 
@@ -20,20 +19,18 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
-from teleop.robot_control.robot_arm import G1_29_ArmController, G1_29_Arm_Internal_Dex1_Controller
 from teleop.robot_control.robot_arm_ik import G1_29_ArmIK
-from teleop.robot_control.robot_hand_unitree import Dex3_1_Controller, Dex1_1_Gripper_Controller
-from teleop.robot_control.robot_hand_inspire import Inspire_Controller_DFX, Inspire_Controller_FTP, Inspire_Controller_DFX_ctrl, Inspire_Controller_FTP_ctrl
-from teleop.robot_control.robot_hand_brainco import Brainco_Controller_hand, Brainco_Controller_ctrl
 from teleop.robot_control.mobile_control import G1_Mobile_Lift_Controller
 from teleop.utils.instruction_map import ControlDataMapper, HandleInstruction
 
 from teleop.teleimager.src.teleimager.image_client import ImageClient
+from teleop.utils.arm_owner_lock import ArmOwnerLockError, acquire_arm_owner_lock
+from teleop.utils.dex1_arm_bundle import create_dex1_arm_controller
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.handoff_utils import smoothstep_handoff_gain
 from teleop.utils.rerun_visualizer import should_log_to_rerun
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.controller_shortcuts import ControllerShortcutMapper, toggle_start_pause
-# from teleop.utils.motion_switcher import MotionSwitcher
 from sshkeyboard import listen_keyboard, stop_listening
 
 # for simulation
@@ -110,21 +107,16 @@ def get_state() -> dict:
         "RECORD_TOGGLE": RECORD_TOGGLE,
     }
 
-def smoothstep_resume_gain(elapsed, duration):
-    if duration <= 0.0:
-        return 1.0
-    progress = float(np.clip(elapsed / duration, 0.0, 1.0))
-    return progress * progress * (3.0 - 2.0 * progress)
-
-
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="G1-D Dex1-internal XR data collection (support matrix: dex1_internal + controller/hand).",
+    )
     # basic control parameters
     parser.add_argument('--frequency', type = float, default = 30.0, help = 'control and record \'s frequency')
     parser.add_argument('--input-mode', type=str, choices=['hand', 'controller'], default='controller', help='Select XR device input tracking source')
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
-    parser.add_argument('--arm', type=str, choices=['G1'], default='G1', help='Select arm controller')
-    parser.add_argument('--ee', type=str, choices=['dex1', 'dex1_internal', 'dex3', 'brainco', 'inspire_ftp', 'inspire_dfx'], help='Select end effector controller')
+    parser.add_argument('--ee', type=str, choices=['dex1_internal'], default='dex1_internal',
+                        help='End effector (G1-D production path: dex1_internal only)')
     # mobile base, elevation and waist control
     parser.add_argument('--base-type', type=str, choices=['mobile_lift', 'lift','legs'], default='mobile_lift', help='Select lower body type')
     parser.add_argument('--use-waist', action = 'store_true', help = 'Enable waist control')
@@ -135,6 +127,8 @@ if __name__ == '__main__':
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
+    parser.add_argument('--force', action='store_true',
+                        help='Bypass arm-owner lock (dangerous if collect/deploy already running)')
     # record mode and task info
     parser.add_argument('--record', action = 'store_true', default = True, help = 'Record episodes (default: on)')
     parser.add_argument('--no-record', action = 'store_false', dest = 'record', help = 'Teleoperate without writing episodes')
@@ -148,6 +142,14 @@ if __name__ == '__main__':
     logger_mp.info(f"args: {args}")
 
     from teleop.televuer.tv_wrapper import TeleVuerWrapper
+
+    arm_lock = None
+    try:
+        if not args.force:
+            arm_lock = acquire_arm_owner_lock("collect")
+    except ArmOwnerLockError as lock_error:
+        logger_mp.error("%s", lock_error)
+        sys.exit(1)
 
     try:
         if args.sim:
@@ -184,99 +186,17 @@ if __name__ == '__main__':
                                      arm_reference_mode="head_yaw" # another choice is "head_position".
                                      )
 
-        # Enter debug mode
-        # motion_switcher = MotionSwitcher()
-        # status, result = motion_switcher.Enter_Debug_Mode()
-        # logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
-        
-        xr_motion_data_ready = Value('b', False, lock=True)
-        # arm
-        if args.arm == "G1":
-            arm_ik = G1_29_ArmIK()
-            if args.ee == "dex1_internal":
-                left_gripper_value = Value('d', 0.0, lock=True)        # [input]
-                right_gripper_value = Value('d', 0.0, lock=True)       # [input]
-                dual_gripper_data_lock = Lock()
-                dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
-                dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-                arm_ctrl = G1_29_Arm_Internal_Dex1_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock,
-                                                              dual_gripper_state_array, dual_gripper_action_array,
-                                                              simulation_mode=args.sim, use_waist=args.use_waist,
-                                                              xr_motion_data_ready_in=xr_motion_data_ready)
-            else:
-                arm_ctrl = G1_29_ArmController(simulation_mode=args.sim, use_waist=args.use_waist)
-
-        # end-effector
-        if args.ee == "dex3":
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
-            dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
-            hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
-        elif args.ee == "dex1": # external
-            left_gripper_value = Value('d', 0.0, lock=True)        # [input]
-            right_gripper_value = Value('d', 0.0, lock=True)       # [input]
-            dual_gripper_data_lock = Lock()
-            dual_gripper_state_array = Array('d', 2, lock=False)   # current left, right gripper state(2) data.
-            dual_gripper_action_array = Array('d', 2, lock=False)  # current left, right gripper action(2) data.
-            gripper_ctrl = Dex1_1_Gripper_Controller(left_gripper_value, right_gripper_value, dual_gripper_data_lock, 
-                                                     dual_gripper_state_array, dual_gripper_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
-        elif args.ee == "inspire_dfx" and args.input_mode == "hand":
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_DFX(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
-        elif args.ee == "inspire_dfx" and args.input_mode == "controller":
-            left_gripper_trigger_in = Value('d', 10.0, lock=True)  # [input]
-            left_gripper_squeeze_in = Value('d', 0.0, lock=True)   # [input]
-            right_gripper_trigger_in = Value('d', 10.0, lock=True) # [input]
-            right_gripper_squeeze_in = Value('d', 0.0, lock=True)  # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_DFX_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
-                                                    dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
-        elif args.ee == "inspire_ftp" and args.input_mode == "hand":
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_FTP(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
-        elif args.ee == "inspire_ftp" and args.input_mode == "controller":
-            left_gripper_trigger_in = Value('d', 10.0, lock=True)  # [input]
-            left_gripper_squeeze_in = Value('d', 0.0, lock=True)   # [input]
-            right_gripper_trigger_in = Value('d', 10.0, lock=True) # [input]
-            right_gripper_squeeze_in = Value('d', 0.0, lock=True)  # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Inspire_Controller_FTP_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
-                                                    dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
-        elif args.ee == "brainco" and args.input_mode == "hand":
-            left_hand_pos_array = Array('d', 75, lock = True)      # [input]
-            right_hand_pos_array = Array('d', 75, lock = True)     # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Brainco_Controller_hand(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                                dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
-        elif args.ee == "brainco" and args.input_mode == "controller":
-            left_gripper_trigger_in = Value('d', 10.0, lock=True)  # [input]
-            left_gripper_squeeze_in = Value('d', 0.0, lock=True)   # [input]
-            right_gripper_trigger_in = Value('d', 10.0, lock=True) # [input]
-            right_gripper_squeeze_in = Value('d', 0.0, lock=True)  # [input]
-            dual_hand_data_lock = Lock()
-            dual_hand_state_array = Array('d', 12, lock = False)   # [output] current left, right hand state(12) data.
-            dual_hand_action_array = Array('d', 12, lock = False)  # [output] current left, right hand action(12) data.
-            hand_ctrl = Brainco_Controller_ctrl(left_gripper_trigger_in, left_gripper_squeeze_in, right_gripper_trigger_in, right_gripper_squeeze_in,
-                                                dual_hand_data_lock, dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim, xr_motion_data_ready_in=xr_motion_data_ready)
-        else:
-            pass
+        arm_ik = G1_29_ArmIK()
+        bundle = create_dex1_arm_controller(
+            simulation_mode=args.sim, use_waist=args.use_waist,
+        )
+        arm_ctrl = bundle.arm_ctrl
+        xr_motion_data_ready = bundle.xr_motion_data_ready
+        left_gripper_value = bundle.left_gripper_value
+        right_gripper_value = bundle.right_gripper_value
+        dual_gripper_data_lock = bundle.dual_gripper_data_lock
+        dual_gripper_state_array = bundle.dual_gripper_state_array
+        dual_gripper_action_array = bundle.dual_gripper_action_array
 
         # For mobile base and elevation control
         if args.base_type != "legs":
@@ -364,33 +284,16 @@ if __name__ == '__main__':
                         publish_reset_category(1, reset_pose_publisher)
 
             follow_xr = (not PAUSED)
-            # logger_mp.info(f"tele_data: {tele_data}")
-            if follow_xr and args.ee in ("dex3", "inspire_ftp", "inspire_dfx", "brainco") and args.input_mode == "hand":
-                with left_hand_pos_array.get_lock():
-                    left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
-                with right_hand_pos_array.get_lock():
-                    right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
-            elif follow_xr and args.ee in ("brainco", "inspire_dfx", "inspire_ftp") and args.input_mode == "controller":
-                with left_gripper_trigger_in.get_lock():
-                    left_gripper_trigger_in.value = tele_data.left_ctrl_triggerValue
-                with left_gripper_squeeze_in.get_lock():
-                    left_gripper_squeeze_in.value = tele_data.left_ctrl_squeezeValue
-                with right_gripper_trigger_in.get_lock():
-                    right_gripper_trigger_in.value = tele_data.right_ctrl_triggerValue
-                with right_gripper_squeeze_in.get_lock():
-                    right_gripper_squeeze_in.value = tele_data.right_ctrl_squeezeValue
-            elif follow_xr and args.ee in ("dex1", "dex1_internal") and args.input_mode == "controller":
+            if follow_xr and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_ctrl_triggerValue
-            elif follow_xr and args.ee in ("dex1", "dex1_internal") and args.input_mode == "hand":
+            elif follow_xr and args.input_mode == "hand":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_hand_pinchValue
                 with right_gripper_value.get_lock():
                     right_gripper_value.value = tele_data.right_hand_pinchValue
-            else:
-                pass
             with xr_motion_data_ready.get_lock():
                 xr_motion_data_ready.value = tele_data.motion_data_ready
             
@@ -458,7 +361,7 @@ if __name__ == '__main__':
                 if held_sol_q is not None:
                     if resume_blend_t0 is None:
                         resume_blend_t0 = time.time()
-                    gain = smoothstep_resume_gain(time.time() - resume_blend_t0, RESUME_BLEND_SECONDS)
+                    gain = smoothstep_handoff_gain(time.time() - resume_blend_t0, RESUME_BLEND_SECONDS)
                     hold_q = np.asarray(held_sol_q, dtype=float)
                     if hold_q.shape != sol_q.shape:
                         if hold_q.size < sol_q.size:
@@ -483,56 +386,17 @@ if __name__ == '__main__':
             # record data
             if args.record:
                 READY = recorder.is_ready() # now ready to (2) enter RECORD_RUNNING state
-                # dex hand or gripper
-                if args.ee == "dex3" and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:7]
-                        right_ee_state = dual_hand_state_array[-7:]
-                        left_hand_action = dual_hand_action_array[:7]
-                        right_hand_action = dual_hand_action_array[-7:]
-                        current_body_state = []
-                        current_body_action = []
-                elif args.ee in ("dex1", "dex1_internal") and args.input_mode == "hand":
-                    with dual_gripper_data_lock:
-                        left_ee_state = [dual_gripper_state_array[0]]
-                        right_ee_state = [dual_gripper_state_array[1]]
-                        left_hand_action = [dual_gripper_action_array[0]]
-                        right_hand_action = [dual_gripper_action_array[1]]
-                        current_body_state = []
-                        current_body_action = []
-                elif args.ee in ("dex1", "dex1_internal") and args.input_mode == "controller":
-                    with dual_gripper_data_lock:
-                        left_ee_state = [dual_gripper_state_array[0]]
-                        right_ee_state = [dual_gripper_state_array[1]]
-                        left_hand_action = [dual_gripper_action_array[0]]
-                        right_hand_action = [dual_gripper_action_array[1]]
-                        current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
-                elif (args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:6]
-                        right_ee_state = dual_hand_state_array[-6:]
-                        left_hand_action = dual_hand_action_array[:6]
-                        right_hand_action = dual_hand_action_array[-6:]
-                        current_body_state = []
-                        current_body_action = []
-                elif (args.ee in ("brainco", "inspire_dfx", "inspire_ftp") and args.input_mode == "controller"):
-                    with dual_hand_data_lock:
-                        left_ee_state = dual_hand_state_array[:6]
-                        right_ee_state = dual_hand_state_array[-6:]
-                        left_hand_action = dual_hand_action_array[:6]
-                        right_hand_action = dual_hand_action_array[-6:]
-                        current_body_state = arm_ctrl.get_current_motor_q().tolist()
-                        current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
-                                               -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
-                                               -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
+                with dual_gripper_data_lock:
+                    left_ee_state = [dual_gripper_state_array[0]]
+                    right_ee_state = [dual_gripper_state_array[1]]
+                    left_hand_action = [dual_gripper_action_array[0]]
+                    right_hand_action = [dual_gripper_action_array[1]]
+                if args.input_mode == "controller":
+                    current_body_state = arm_ctrl.get_current_motor_q().tolist()
+                    current_body_action = [-tele_data.left_ctrl_thumbstickValue[1]  * 0.3,
+                                           -tele_data.left_ctrl_thumbstickValue[0]  * 0.3,
+                                           -tele_data.right_ctrl_thumbstickValue[0] * 0.3]
                 else:
-                    left_ee_state = []
-                    right_ee_state = []
-                    left_hand_action = []
-                    right_hand_action = []
                     current_body_state = []
                     current_body_action = []
 
@@ -712,13 +576,6 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
 
-        # try:
-        #     if not args.motion:
-        #         status, result = motion_switcher.Exit_Debug_Mode()
-        #         logger_mp.info(f"Exit debug mode: {'Success' if status == 3104 else 'Failed'}")
-        # except Exception as e:
-        #     logger_mp.error(f"Failed to exit debug mode: {e}")
-
         try:
             if args.sim:
                 sim_state_subscriber.stop_subscribe()
@@ -730,4 +587,6 @@ if __name__ == '__main__':
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+        if arm_lock is not None:
+            arm_lock.release()
         logger_mp.info("Finally, exiting program.")

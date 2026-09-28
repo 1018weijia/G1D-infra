@@ -51,8 +51,9 @@ def load_ready_pose(path):
 
 
 def smoothstep(progress):
-    p = float(np.clip(progress, 0.0, 1.0))
-    return p * p * (3.0 - 2.0 * p)
+    """0-to-1 ease; delegates to the shared handoff smoothstep."""
+    from teleop.utils.handoff_utils import smoothstep_handoff_gain
+    return smoothstep_handoff_gain(float(progress), 1.0)
 
 
 def ready_pose_profile(current_q, target_q, seconds, frequency):

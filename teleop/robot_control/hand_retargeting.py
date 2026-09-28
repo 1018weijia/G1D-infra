@@ -20,14 +20,14 @@ _ASSETS = os.path.join(_REPO_ROOT, "assets")
 
 class HandType(Enum):
     INSPIRE_HAND = os.path.join(_ASSETS, "inspire_hand", "inspire_hand.yml")
-    INSPIRE_HAND_Unit_Test = os.path.join(_ASSETS, "inspire_hand", "inspire_hand.yml")
     UNITREE_DEX3 = os.path.join(_ASSETS, "unitree_hand", "unitree_dex3.yml")
-    UNITREE_DEX3_Unit_Test = os.path.join(_ASSETS, "unitree_hand", "unitree_dex3.yml")
     BRAINCO_HAND = os.path.join(_ASSETS, "brainco_hand", "brainco.yml")
-    BRAINCO_HAND_Unit_Test = os.path.join(_ASSETS, "brainco_hand", "brainco.yml")
+
 
 class HandRetargeting:
-    def __init__(self, hand_type: HandType):
+    def __init__(self, hand_type: HandType, unit_test: bool = False):
+        # unit_test kept for call-site compatibility; YAML paths are shared.
+        del unit_test
         RetargetingConfig.set_default_urdf_dir(_ASSETS)
 
         config_file_path = Path(hand_type.value)
@@ -35,7 +35,7 @@ class HandRetargeting:
         try:
             with config_file_path.open('r') as f:
                 self.cfg = yaml.safe_load(f)
-                
+
             if 'left' not in self.cfg or 'right' not in self.cfg:
                 raise ValueError("Configuration file must contain 'left' and 'right' keys.")
 
@@ -49,10 +49,10 @@ class HandRetargeting:
             self.left_indices = self.left_retargeting.optimizer.target_link_human_indices
             self.right_indices = self.right_retargeting.optimizer.target_link_human_indices
 
-            if hand_type == HandType.UNITREE_DEX3 or hand_type == HandType.UNITREE_DEX3_Unit_Test:
+            if hand_type == HandType.UNITREE_DEX3:
                 # In section "Sort by message structure" of https://support.unitree.com/home/en/G1_developer/dexterous_hand
                 self.left_dex3_api_joint_names  = [ 'left_hand_thumb_0_joint', 'left_hand_thumb_1_joint', 'left_hand_thumb_2_joint',
-                                                    'left_hand_middle_0_joint', 'left_hand_middle_1_joint', 
+                                                    'left_hand_middle_0_joint', 'left_hand_middle_1_joint',
                                                     'left_hand_index_0_joint', 'left_hand_index_1_joint' ]
                 self.right_dex3_api_joint_names = [ 'right_hand_thumb_0_joint', 'right_hand_thumb_1_joint', 'right_hand_thumb_2_joint',
                                                     'right_hand_middle_0_joint', 'right_hand_middle_1_joint',
@@ -60,7 +60,7 @@ class HandRetargeting:
                 self.left_dex_retargeting_to_hardware = [ self.left_retargeting_joint_names.index(name) for name in self.left_dex3_api_joint_names]
                 self.right_dex_retargeting_to_hardware = [ self.right_retargeting_joint_names.index(name) for name in self.right_dex3_api_joint_names]
 
-            elif hand_type == HandType.INSPIRE_HAND or hand_type == HandType.INSPIRE_HAND_Unit_Test:
+            elif hand_type == HandType.INSPIRE_HAND:
                 # "Joint Motor Sequence" of https://support.unitree.com/home/en/G1_developer/inspire_dfx_dexterous_hand
                 self.left_inspire_api_joint_names  = [ 'L_pinky_proximal_joint', 'L_ring_proximal_joint', 'L_middle_proximal_joint',
                                                        'L_index_proximal_joint', 'L_thumb_proximal_pitch_joint', 'L_thumb_proximal_yaw_joint' ]
@@ -68,8 +68,8 @@ class HandRetargeting:
                                                        'R_index_proximal_joint', 'R_thumb_proximal_pitch_joint', 'R_thumb_proximal_yaw_joint' ]
                 self.left_dex_retargeting_to_hardware = [ self.left_retargeting_joint_names.index(name) for name in self.left_inspire_api_joint_names]
                 self.right_dex_retargeting_to_hardware = [ self.right_retargeting_joint_names.index(name) for name in self.right_inspire_api_joint_names]
-            
-            elif hand_type == HandType.BRAINCO_HAND or hand_type == HandType.BRAINCO_HAND_Unit_Test:
+
+            elif hand_type == HandType.BRAINCO_HAND:
                 # "Driver Motor ID" of https://www.brainco-hz.com/docs/revolimb-hand/product/parameters.html
                 self.left_brainco_api_joint_names  = [ 'left_thumb_metacarpal_joint', 'left_thumb_proximal_joint', 'left_index_proximal_joint',
                                                        'left_middle_proximal_joint', 'left_ring_proximal_joint', 'left_pinky_proximal_joint' ]
@@ -77,7 +77,7 @@ class HandRetargeting:
                                                        'right_middle_proximal_joint', 'right_ring_proximal_joint', 'right_pinky_proximal_joint' ]
                 self.left_dex_retargeting_to_hardware = [ self.left_retargeting_joint_names.index(name) for name in self.left_brainco_api_joint_names]
                 self.right_dex_retargeting_to_hardware = [ self.right_retargeting_joint_names.index(name) for name in self.right_brainco_api_joint_names]
-        
+
         except FileNotFoundError:
             logger_mp.warning(f"Configuration file not found: {config_file_path}")
             raise
