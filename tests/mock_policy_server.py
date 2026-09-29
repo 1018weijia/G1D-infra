@@ -33,6 +33,24 @@ def main():
             if state.size != 16:
                 sock.send(pickle.dumps({"status": "error", "message": f"bad state dim {state.size}"}))
                 continue
+            layout = req.get("image_layout", "stitched" if req.get("first_frame") is not None else "separate")
+            if layout == "stitched":
+                frame = req.get("first_frame")
+                if frame is None:
+                    sock.send(pickle.dumps({"status": "error", "message": "missing first_frame"}))
+                    continue
+                image_desc = f"frame={np.asarray(frame).shape}"
+            elif layout == "separate":
+                images = req.get("images") or {}
+                if not images:
+                    sock.send(pickle.dumps({"status": "error", "message": "missing images"}))
+                    continue
+                image_desc = "images=" + ",".join(
+                    f"{name}:{np.asarray(image).shape}" for name, image in images.items()
+                )
+            else:
+                sock.send(pickle.dumps({"status": "error", "message": f"bad image_layout {layout}"}))
+                continue
             actions = np.tile(state, (args.chunk_steps, 1)).astype(np.float32)
             sock.send(pickle.dumps({
                 "status": "ok",
@@ -41,7 +59,7 @@ def main():
             }))
             served += 1
             print(f"served request {served} instruction={req.get('instruction')!r} "
-                  f"frame={np.asarray(req.get('first_frame')).shape}", flush=True)
+                  f"{image_desc}", flush=True)
             if args.requests and served >= args.requests:
                 break
     except KeyboardInterrupt:

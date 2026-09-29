@@ -20,6 +20,40 @@ import yaml
 logger = logging.getLogger(__name__)
 
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
+_IMAGE_LAYOUTS = ("stitched", "separate")
+
+
+@dataclass
+class PolicyObservation:
+    """One inference observation. Images depend on image_layout."""
+
+    image_layout: str
+    state: np.ndarray
+    first_frame: Optional[np.ndarray] = None
+    images: Optional[dict] = None
+
+
+def build_zmq_request(observation: PolicyObservation, instruction: str) -> dict:
+    """Pickle payload for the ZMQ policy server. State and RTC fields stay fixed."""
+    if observation.image_layout not in _IMAGE_LAYOUTS:
+        raise ValueError(f"unsupported image_layout {observation.image_layout!r}")
+    request = {
+        "image_layout": observation.image_layout,
+        "state": np.asarray(observation.state, dtype=np.float32),
+        "instruction": instruction,
+        "rtc_prev": None,
+        "rtc_inference_delay": None,
+    }
+    if observation.image_layout == "stitched":
+        if observation.first_frame is None:
+            raise ValueError("stitched observation is missing first_frame")
+        request["first_frame"] = np.asarray(observation.first_frame)
+        return request
+    images = observation.images or {}
+    if not images:
+        raise ValueError("separate observation is missing images")
+    request["images"] = {name: np.asarray(image) for name, image in images.items()}
+    return request
 
 
 def validate_action_chunk(actions, max_abs_arm_q: float = 3.5,
@@ -255,18 +289,12 @@ class PolicyRemoteClient:
             )
         return actions, predict_ms
 
-    def _predict_zmq(self, first_frame_np, state_np, instruction):
+    def _predict_zmq(self, observation, instruction):
         if self._closed:
             raise RuntimeError("policy client is closed")
         import zmq
 
-        req = {
-            "first_frame": np.asarray(first_frame_np),
-            "state": np.asarray(state_np, dtype=np.float32),
-            "instruction": instruction,
-            "rtc_prev": None,
-            "rtc_inference_delay": None,
-        }
+        req = build_zmq_request(observation, instruction)
         last_err = None
         for _ in range(2):
             sock = None
@@ -296,14 +324,19 @@ class PolicyRemoteClient:
             raise RuntimeError(f"ZMQ server error: {resp.get('message', 'unknown')}")
         return self._finalize_actions(resp["actions"], resp.get("predict_ms", 0.0))
 
-    def predict(self, first_frame_np, state_np, instruction):
+    def predict(self, observation, instruction):
         if self.protocol == "zmq":
-            return self._predict_zmq(first_frame_np, state_np, instruction)
+            return self._predict_zmq(observation, instruction)
+        if observation.image_layout != "stitched":
+            raise RuntimeError(
+                "WebSocket inference only accepts image_layout=stitched; "
+                "use protocol zmq for separate cameras"
+            )
         payload = {
             "type": "inference",
             "instruction": instruction,
-            "image": encode_jpeg_b64(first_frame_np),
-            "state": np.asarray(state_np, dtype=np.float32).reshape(-1).tolist(),
+            "image": encode_jpeg_b64(observation.first_frame),
+            "state": np.asarray(observation.state, dtype=np.float32).reshape(-1).tolist(),
             "auto_find_t5_embeddings": True,
         }
         if self._closed:
@@ -362,6 +395,11 @@ class PolicyAdapter:
         self._video_height = int(common["video_height"])
         self._video_width = int(common["video_width"])
         self._stitch_mode = str(ds_cfg.get("stitch_mode", "aspect"))
+        self.image_layout = str(ds_cfg.get("image_layout", "stitched")).lower()
+        if self.image_layout not in _IMAGE_LAYOUTS:
+            raise ValueError(
+                f"image_layout must be one of {_IMAGE_LAYOUTS}, got {self.image_layout!r}"
+            )
         self.action_mode = str(ds_cfg.get("action_mode", "qpos"))
         self.current_instruction = instruction
         self.action_interp_factor = max(1, int(action_interp_factor))
@@ -477,9 +515,6 @@ class PolicyAdapter:
         right_rgb = cv2.cvtColor(right_wrist_bgr, cv2.COLOR_BGR2RGB)
         if self.swap_wrists:
             left_rgb, right_rgb = right_rgb, left_rgb
-        stitched = self.build_stitched_image(head_rgb, left_rgb, right_rgb)
-        first_frame_np = (stitched * 255).astype(np.uint8)
-
         if self.action_mode != "qpos":
             raise NotImplementedError("policy handoff supports qpos action mode only")
         raw_state = np.zeros(16, dtype=np.float32)
@@ -487,8 +522,26 @@ class PolicyAdapter:
         raw_state[7:14] = current_arm_q[7:14]
         raw_state[14] = float(left_grip)
         raw_state[15] = float(right_grip)
-        state = self._to_arm_interleaved(raw_state)
-        return first_frame_np, state.astype(np.float32)
+        state = self._to_arm_interleaved(raw_state).astype(np.float32)
+        if self.image_layout == "stitched":
+            stitched = self.build_stitched_image(head_rgb, left_rgb, right_rgb)
+            first_frame_np = (stitched * 255).astype(np.uint8)
+            return PolicyObservation(
+                image_layout="stitched",
+                state=state,
+                first_frame=first_frame_np,
+            )
+        if head_rgb.shape[1] < 2:
+            raise ValueError("head frame is too narrow to split out the left eye")
+        return PolicyObservation(
+            image_layout="separate",
+            state=state,
+            images={
+                "left_eye": np.ascontiguousarray(head_rgb[:, : head_rgb.shape[1] // 2]),
+                "left_wrist": np.ascontiguousarray(left_rgb),
+                "right_wrist": np.ascontiguousarray(right_rgb),
+            },
+        )
 
     def interpolate_chunk(self, actions):
         actions = np.asarray(actions, dtype=float)

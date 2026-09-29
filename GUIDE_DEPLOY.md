@@ -71,6 +71,8 @@ INSTRUCTION="your task" \
 
 准备姿势默认取自这台 G1-D 已验证的遥操作启动关节命令，顺序是左臂 7 关节、右臂 7 关节。若现场要校准姿势，复制并修改 `configs/ready_pose.json`，再通过 `READY_POSE_CONFIG` 指向新文件；不要把过渡时间设为 0，程序会拒绝瞬间跳到目标。
 
+ZMQ 图像由 [`configs/infer_g1d.yaml`](configs/infer_g1d.yaml) 的 `dataset.image_layout` 决定，状态和动作格式不变。`stitched`（默认）把头顶和左右腕拼成一张 `first_frame`。`separate` 不拼接，`images` 为 `left_eye`（双目头图左半幅）、`left_wrist`、`right_wrist`，保持相机原分辨率。服务端按 `image_layout` 取字段。WebSocket 只支持 `stitched`。
+
 可选 `--record` 把部署过程存成 episode（默认关）。录制时状态转换会追加写 `intervention.jsonl`（`rollback_start` / `align_ok` / `teleop_enter` / `teleop_hold` / `policy_resume`）；逐帧 `actions.phase` 也会标 `TELEOP_HOLD`。失败用键盘 `F` 或左柄 `X` 标记，与数采语义一致。
 
 ## 操作闭环

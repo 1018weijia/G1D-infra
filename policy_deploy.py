@@ -241,17 +241,17 @@ def _prepare_policy_request(adapter, img_client, arm_ctrl):
     right_wrist_img = img_client.get_right_wrist_frame()
     if head_img is None or left_wrist_img is None or right_wrist_img is None:
         raise RuntimeError("missing camera frame for policy inference")
-    first_frame_np, state_np = adapter.build_model_input(
+    observation = adapter.build_model_input(
         head_img.bgr, left_wrist_img.bgr, right_wrist_img.bgr,
         current_arm_q, left_grip, right_grip,
     )
-    return first_frame_np, state_np, current_arm_q
+    return observation, current_arm_q
 
 
 def _predict_policy_queue(adapter, remote, request, instruction):
     """Run the blocking cloud request; intended for the inference worker only."""
-    first_frame_np, state_np, current_arm_q = request
-    actions, predict_ms = remote.predict(first_frame_np, state_np, instruction)
+    observation, current_arm_q = request
+    actions, predict_ms = remote.predict(observation, instruction)
     queue = adapter.build_exec_queue(actions, current_arm_q)
     logger_mp.info("Policy chunk received: predict=%.1fms queue=%d", predict_ms, len(queue))
     return queue
@@ -496,6 +496,7 @@ if __name__ == "__main__":
             exec_chunk_steps=args.exec_chunk_steps,
             pad_joint_values=pad_joint_values,
         )
+        logger_mp.info("Policy image layout: %s", adapter.image_layout)
         # Connect lazily in the inference worker so startup and Q remain responsive.
         remote = PolicyRemoteClient(
             args.server_host,

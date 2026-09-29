@@ -43,8 +43,13 @@ def main():
     wrist_r = rng.integers(0, 255, (480, 640, 3), dtype=np.uint8)
     arm_q = np.zeros(14, dtype=float)
 
-    frame, state = adapter.build_model_input(head, wrist_l, wrist_r, arm_q, 0.0, 0.0)
-    print(f"stitched frame {frame.shape} dtype={frame.dtype}, state dim {state.shape[0]}")
+    observation = adapter.build_model_input(head, wrist_l, wrist_r, arm_q, 0.0, 0.0)
+    if observation.image_layout == "stitched":
+        print(f"stitched frame {observation.first_frame.shape} dtype={observation.first_frame.dtype}, "
+              f"state dim {observation.state.shape[0]}")
+    else:
+        shapes = {name: image.shape for name, image in observation.images.items()}
+        print(f"separate images {shapes}, state dim {observation.state.shape[0]}")
 
     client = PolicyRemoteClient(
         server_host=args.server_host,
@@ -53,7 +58,7 @@ def main():
         protocol=args.protocol,
     )
     try:
-        actions, predict_ms = client.predict(frame, state, args.instruction)
+        actions, predict_ms = client.predict(observation, args.instruction)
     finally:
         client.close()
     print(f"action chunk {actions.shape}, predict {predict_ms:.1f} ms")

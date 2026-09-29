@@ -366,6 +366,7 @@ served request 1 instruction='pick up the red cup' frame=(384, 320, 3)
 - `state dim 16`、`action chunk (64, 16)` 对应 `state_dim: 16` 和 `num_video_frames(8) × video_action_freq_ratio(8) = 64`。
 - `exec queue 8 steps` 来自 `--exec-chunk-steps 8`；`action_interp_factor=1` 所以不插值。
 - `roundtrip OK` 说明 `validate_action_chunk` 放行了，动作能转成机器人命令。
+- 默认 `image_layout: stitched`。改成 `separate` 后不拼图，请求里是 `images` 的 `left_eye`、`left_wrist`、`right_wrist`，没有 `first_frame`。
 
 改 `configs/infer_g1d.yaml` 之后重跑这一级，是确认改动没写错最快的办法。
 
