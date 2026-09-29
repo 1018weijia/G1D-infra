@@ -2,8 +2,6 @@
 
 `collect.py` 只做 XR 遥操作录制。没有 policy、没有回退、没有接管。
 
-**支持矩阵**：G1-D + Dex1 internal + controller/hand。其它末端不再从入口接入。
-
 ## 启动
 
 ```bash
@@ -17,12 +15,7 @@ cd ~/g1d_infra
 
 ```bash
 cd ~/g1d_infra
-UNITREE_DDSINTERFACE=eth0 python collect.py \
-  --ee dex1_internal \
-  --input-mode controller \
-  --task-dir ~/unitree_eai_environment/data/ \
-  --task-name pick_place \
-  --task-goal "pick and place"
+UNITREE_DDSINTERFACE=eth0 python collect.py --ee dex1_internal --input-mode controller --task-dir ~/unitree_eai_environment/data/ --task-name test_only --task-goal "test_only"
 ```
 
 录制默认开启。想只遥操作、不写盘（练手或调试）加 `--no-record`。
@@ -73,11 +66,8 @@ python scripts/episode_summary.py ~/unitree_eai_environment/data/pick_place
 
 ```bash
 cd ~/g1d_infra/data_convert
-./convert.sh --raw-dir ~/unitree_eai_environment/data/pick_place \
-             --output-dir ~/g1d_infra/datasets/pick_place \
-             --bad 3,7      # 可选：采集时没标、事后才看出来的坏轨迹
-./upload.sh --token "$MODELSCOPE_API_TOKEN" --repo owner/pick_place \
-            --local-dir ~/g1d_infra/datasets/pick_place
+./convert.sh --raw-dir ~/unitree_eai_environment/data/pick_place --output-dir ~/g1d_infra/datasets/pick_place --bad 3,7 # 可选：采集时没标、事后才看出来的坏轨迹
+./upload.sh --token "$MODELSCOPE_API_TOKEN" --repo owner/pick_place --local-dir ~/g1d_infra/datasets/pick_place
 ```
 
 `--raw-dir` 与 `--output-dir` 为必填。

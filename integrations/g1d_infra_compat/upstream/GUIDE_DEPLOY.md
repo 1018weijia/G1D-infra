@@ -49,10 +49,7 @@ TELEOP_LIVE
 
 ```bash
 cd ~/g1d_infra
-SSH_HOST=... SSH_PORT=... SSH_USER=... SSH_KEY=... \
-REMOTE_POLICY_HOST=... REMOTE_POLICY_PORT=5555 \
-INSTRUCTION="your task" \
-./scripts/run_deploy.sh
+SSH_HOST=... SSH_PORT=... SSH_USER=... SSH_KEY=... REMOTE_POLICY_HOST=... REMOTE_POLICY_PORT=5555 INSTRUCTION="your task" ./scripts/run_deploy.sh
 ```
 
 只检查配置、不连云端或机器人：

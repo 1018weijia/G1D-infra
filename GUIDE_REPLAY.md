@@ -16,8 +16,7 @@ cd ~/g1d_infra
 给目录或者目录里的 `data.json` 都行。等价于：
 
 ```bash
-UNITREE_DDSINTERFACE=eth0 python -m teleop.replay \
-  --data-json ~/unitree_eai_environment/data/pick_place/episode_0000/data.json
+UNITREE_DDSINTERFACE=eth0 python -m teleop.replay --data-json ~/unitree_eai_environment/data/pick_place/episode_0000/data.json
 ```
 
 **先 `--dry-run`**。它只加载、校验、打印摘要，完全不碰机器人：

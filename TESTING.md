@@ -111,9 +111,7 @@ OK
 ```bash
 cd ~/g1d_infra
 rm -rf /tmp/g1d_fake
-python tests/make_fake_episodes.py \
-  --task-dir /tmp/g1d_fake/fake_task \
-  --episodes 3 --frames 20 --fail 1
+python tests/make_fake_episodes.py --task-dir /tmp/g1d_fake/fake_task --episodes 3 --frames 20 --fail 1
 ```
 
 **成功标志**
@@ -152,9 +150,7 @@ print(list(d), d['success'], len(d['data']))"
 ```bash
 cd ~/g1d_infra
 rm -rf /tmp/g1d_fake/out
-./data_convert/convert.sh \
-  --raw-dir /tmp/g1d_fake/fake_task \
-  --output-dir /tmp/g1d_fake/out
+./data_convert/convert.sh --raw-dir /tmp/g1d_fake/fake_task --output-dir /tmp/g1d_fake/out
 ```
 
 中途会刷大量 `libx264` / ffmpeg 日志，属正常。
@@ -251,11 +247,7 @@ print(df.groupby('complementary_info.source_episode_index')[['next.success','com
 
 ```bash
 cd ~/g1d_infra
-./data_convert/upload.sh \
-  --token fake-token \
-  --repo demo/fake_task \
-  --local-dir /tmp/g1d_fake/out \
-  --dry-run
+./data_convert/upload.sh --token fake-token --repo demo/fake_task --local-dir /tmp/g1d_fake/out --dry-run
 ```
 
 **成功标志**
@@ -380,9 +372,7 @@ python tests/mock_policy_server.py --bind tcp://0.0.0.0:5555
 
 # 机器人上
 cd ~/g1d_infra
-SSH_HOST=<gpu-ip> SSH_PORT=22 SSH_USER=<user> SSH_KEY=~/.ssh/id_rsa \
-REMOTE_POLICY_HOST=127.0.0.1 REMOTE_POLICY_PORT=5555 \
-./scripts/run_deploy.sh --dry-run
+SSH_HOST=<gpu-ip> SSH_PORT=22 SSH_USER=<user> SSH_KEY=~/.ssh/id_rsa REMOTE_POLICY_HOST=127.0.0.1 REMOTE_POLICY_PORT=5555 ./scripts/run_deploy.sh --dry-run
 ```
 
 `--dry-run` 只打印配置就退出，**不会**建隧道也不会校验 `INSTRUCTION`：
@@ -457,8 +447,7 @@ cd ~/g1d_infra
 
 ```bash
 cd ~/g1d_infra
-TASK_DIR=/tmp/g1d_test_data TASK_NAME=smoke_test TASK_GOAL="pick and place" \
-./scripts/run_collect.sh
+TASK_DIR=/tmp/g1d_test_data TASK_NAME=smoke_test TASK_GOAL="pick and place" ./scripts/run_collect.sh
 ```
 
 按这个顺序走一遍：
@@ -510,9 +499,7 @@ for i in (0,1):
 
 ```bash
 cd ~/g1d_infra
-./data_convert/convert.sh \
-  --raw-dir /tmp/g1d_test_data/smoke_test \
-  --output-dir /tmp/g1d_test_out
+./data_convert/convert.sh --raw-dir /tmp/g1d_test_data/smoke_test --output-dir /tmp/g1d_test_out
 ```
 
 **成功标志**：`Auto-detected failed episodes ...: [1]`、`Converted 2 episodes, tagged bad=1`，且 `meta/episode_quality.json` 里 `(1, True)`。这一步是在真实数据上验证 L2.2b 的自动识别——采数时按的左 X 一路传到了数据集标签。
@@ -557,10 +544,7 @@ GPU 机先起推理服务，然后：
 
 ```bash
 cd ~/g1d_infra
-SSH_HOST=<gpu-ip> SSH_PORT=22 SSH_USER=<user> SSH_KEY=~/.ssh/id_rsa \
-REMOTE_POLICY_HOST=127.0.0.1 REMOTE_POLICY_PORT=5555 \
-INSTRUCTION="pick up the red cup" \
-./scripts/run_deploy.sh
+SSH_HOST=<gpu-ip> SSH_PORT=22 SSH_USER=<user> SSH_KEY=~/.ssh/id_rsa REMOTE_POLICY_HOST=127.0.0.1 REMOTE_POLICY_PORT=5555 INSTRUCTION="pick up the red cup" ./scripts/run_deploy.sh
 ```
 
 **成功标志**
