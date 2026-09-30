@@ -28,7 +28,7 @@ from teleop.utils.arm_owner_lock import ArmOwnerLockError, acquire_arm_owner_loc
 from teleop.utils.dex1_arm_bundle import create_dex1_arm_controller
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.handoff_utils import smoothstep_handoff_gain
-from teleop.utils.ready_pose import cycle_grippers_then_open
+from teleop.utils.ready_pose import GRIPPER_OPEN, cycle_grippers_then_open, move_to_ready_pose
 from teleop.utils.rerun_visualizer import should_log_to_rerun
 from teleop.utils.ipc import IPC_Server
 from teleop.utils.controller_shortcuts import ControllerShortcutMapper, toggle_start_pause
@@ -192,6 +192,10 @@ if __name__ == '__main__':
             simulation_mode=args.sim, use_waist=args.use_waist,
         )
         arm_ctrl = bundle.arm_ctrl
+        # The controller is born targeting joint zero. Hold the measured pose until
+        # the explicit move below, so startup init does not drag the arms partway.
+        startup_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
+        arm_ctrl.ctrl_dual_arm(startup_q, arm_ik.solve_tau(startup_q))
         xr_motion_data_ready = bundle.xr_motion_data_ready
         left_gripper_value = bundle.left_gripper_value
         right_gripper_value = bundle.right_gripper_value
@@ -228,16 +232,31 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      rerun_log = should_log_to_rerun(args.rerun, args.headless))
 
-        logger_mp.info("Cycling grippers, then holding them open. Press Q to abort.")
-        hold_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
-        if not cycle_grippers_then_open(
-                arm_ctrl, hold_q, arm_ik.solve_tau(hold_q), stop_requested=lambda: STOP):
-            logger_mp.warning("Gripper check interrupted.")
+        zero_q = np.zeros(14)
+        logger_mp.info("Moving both arms to the joint-zero pose (3.0s). Press Q to abort.")
+        zero_result = move_to_ready_pose(
+            arm_ctrl,
+            arm_ik,
+            zero_q,
+            3.0,
+            args.frequency,
+            grippers=(GRIPPER_OPEN, GRIPPER_OPEN),
+            stop_requested=lambda: STOP,
+        )
+        if not zero_result.completed:
+            logger_mp.warning("Zero-pose motion interrupted.")
+            STOP = True
         else:
-            arm_ctrl.clear_policy_gripper_direct()
+            logger_mp.info("Arms are at joint zero. Cycling grippers, then holding them open. Press Q to abort.")
+            if not cycle_grippers_then_open(
+                    arm_ctrl, zero_result.arm_q, zero_result.tau, stop_requested=lambda: STOP):
+                logger_mp.warning("Gripper check interrupted.")
+            else:
+                arm_ctrl.clear_policy_gripper_direct()
 
-        logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
-        logger_mp.info("Controller shortcuts: right A=start/pause/resume, left Y=record toggle, left X=fail-stop, right B=quit")
+        if not STOP:
+            logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
+            logger_mp.info("Controller shortcuts: right A=start/pause/resume, left Y=record toggle, left X=fail-stop, right B=quit")
         controller_shortcuts = ControllerShortcutMapper(on_press, get_state)
         last_sol_q = None
         last_sol_tauff = None
