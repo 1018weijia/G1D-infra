@@ -97,6 +97,11 @@ class G1D_Mobile_Waist_Pitch_Controller:
         self.g1_waist_pitch_action_value_in = Value('d', 0.0, lock=True)
         self.g1_waist_pitch_state_value_out = Value('d', 0.0, lock=True)
         self.g1_waist_pitch_action_value_out = Value('d', 0.0, lock=True)
+        # When set, the 200 Hz thread reads A/B itself. The 30 Hz main loop only
+        # flips this, so a slow IK solve cannot freeze a held button at false.
+        self.honor_buttons = Value('b', False, lock=True)
+        self._button_reader = None
+        self._logged_direction = 0.0
 
         self.WaistPitchCmd_publisher = ChannelPublisher(kTopicWaistPitchCmd, MotorCmd_)
         self.WaistPitchCmd_publisher.Init()
@@ -139,14 +144,43 @@ class G1D_Mobile_Waist_Pitch_Controller:
     def get_current_waist_pitch_action(self):
         return self.g1_waist_pitch_action_value_out.value
 
-    def set_waist_pitch_buttons(self, button_bend, button_raise):
+    def set_button_reader(self, reader):
+        """reader() -> (bend, raise). Called from the control thread while honored."""
+        if reader is not None and not callable(reader):
+            raise ValueError("button reader must be callable")
+        self._button_reader = reader
+
+    def set_honor_buttons(self, enabled):
+        self.honor_buttons.value = bool(enabled)
+
+    @staticmethod
+    def _direction_from_buttons(button_bend, button_raise):
         # Pressing both buttons, or neither, is no request.
-        direction = 0.0 if bool(button_bend) == bool(button_raise) else (1.0 if button_bend else -1.0)
+        bend = bool(button_bend)
+        raise_btn = bool(button_raise)
+        if bend == raise_btn:
+            return 0.0
+        return 1.0 if bend else -1.0
+
+    def set_waist_pitch_buttons(self, button_bend, button_raise):
+        direction = self._direction_from_buttons(button_bend, button_raise)
         self.g1_waist_pitch_action_value_in.value = direction
         return direction
 
+    def _log_direction(self, direction):
+        if direction == self._logged_direction:
+            return
+        self._logged_direction = direction
+        if direction > 0.5:
+            logger_mp.info("Waist pitch buttons: hold B, bending")
+        elif direction < -0.5:
+            logger_mp.info("Waist pitch buttons: hold A, straightening")
+        else:
+            logger_mp.info("Waist pitch buttons: released, holding")
+
     def ctrl_waist_pitch_go_home(self, tolerance=0.05, timeout=6.0):
         logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] ctrl_waist_pitch_go_home start...")
+        self.set_honor_buttons(False)
         self.set_waist_pitch_buttons(button_bend=False, button_raise=True)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -171,7 +205,7 @@ class G1D_Mobile_Waist_Pitch_Controller:
             logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] closed.")
 
     def ctrl_g1_waist_pitch(self, q_target):
-        self.g1_waist_pitch_msg.q = q_target
+        self.g1_waist_pitch_msg.q = float(q_target)
         self.WaistPitchCmd_publisher.Write(self.g1_waist_pitch_msg)
 
     def control_thread(self):
@@ -189,7 +223,16 @@ class G1D_Mobile_Waist_Pitch_Controller:
                 dt = min(self.start_time - last_time, 5.0 / self.fps)
                 last_time = self.start_time
 
-                direction = self.g1_waist_pitch_action_value_in.value
+                if self.honor_buttons.value and self._button_reader is not None:
+                    try:
+                        bend, raise_btn = self._button_reader()
+                        direction = self._direction_from_buttons(bend, raise_btn)
+                    except Exception as e:
+                        logger_mp.info(f"[control_thread] waist button read failed: {e}")
+                        direction = 0.0
+                else:
+                    direction = self.g1_waist_pitch_action_value_in.value
+                self._log_direction(direction)
                 measured = self.g1_waist_pitch_state_value_out.value
 
                 if direction > 0.5:
@@ -206,9 +249,9 @@ class G1D_Mobile_Waist_Pitch_Controller:
                     measured + self.DELTA_WAIST_PITCH_CMD,
                 )
 
-                self.g1_waist_pitch_msg.tau = self.gravity_ff.compute(
+                self.g1_waist_pitch_msg.tau = float(self.gravity_ff.compute(
                     np.concatenate(([measured], self.arm_ctrl.get_current_dual_arm_q()))
-                )
+                ))
                 self.ctrl_g1_waist_pitch(q_cmd)
                 self.g1_waist_pitch_action_value_out.value = q_cmd
 

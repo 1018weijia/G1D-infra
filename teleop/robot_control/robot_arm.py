@@ -421,9 +421,15 @@ class G1_29_Arm_Internal_Dex1_Controller:
 
         self.all_motor_q = self.get_current_motor_q()
         self.gripper_q_target = self.get_current_dual_gripper_q()
+        # Pitch stays locked until full-body mode explicitly releases it.
+        # A 250 Hz lowcmd with mode 0 on this slot zeros the stiffness and the
+        # torso falls under a light push, even while rt/waistpitchcmd is holding.
+        self._waist_bend_enabled = False
+        self._waist_pitch_hold_q = float(self.all_motor_q[G1_29_JointIndex.kWaistPitch])
         logger_mp.info(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.info(f"Current arm and waist motor state q:\n{self.get_current_arm_waist_q()}\n")
         logger_mp.info(f"Current dual gripper q: {self.gripper_q_target}")
+        logger_mp.info(f"Waist pitch locked at {self._waist_pitch_hold_q:.4f} rad until body mode.")
 
         arm_indices = set(member.value for member in G1_29_Arm_JointIndex)
         gripper_indices = {self.left_index, self.right_index}
@@ -444,6 +450,17 @@ class G1_29_Arm_Internal_Dex1_Controller:
                 cmd.mode = 1
                 cmd.kp = self.kp_wrist if self._Is_wrist_motor(id) else self.kp_low
                 cmd.kd = self.kd_wrist if self._Is_wrist_motor(id) else self.kd_low
+            elif id.value == G1_29_JointIndex.kWaistRoll.value:
+                # Roll is not driven from lowcmd.
+                cmd.mode = 0
+                cmd.kp = 0.0
+                cmd.kd = 0.0
+            elif id.value == G1_29_JointIndex.kWaistPitch.value:
+                # Hold the measured angle. Body mode is the only path that releases this.
+                cmd.mode = 1
+                cmd.kp = self.kp_high
+                cmd.kd = self.kd_high
+                cmd.q = self._waist_pitch_hold_q
             else:
                 cmd.mode = 1
                 if self._Is_weak_motor(id):
@@ -527,6 +544,31 @@ class G1_29_Arm_Internal_Dex1_Controller:
                 self.msg.motor_cmd[id].dq = 0.0
                 self.msg.motor_cmd[id].tau = tauff_target[idx]
 
+            # Roll stays released. Pitch is locked at the latched angle unless body
+            # mode has released it; this write runs at 250 Hz and would otherwise
+            # put the joint back to zero stiffness.
+            with self.ctrl_lock:
+                bend_enabled = self._waist_bend_enabled
+                pitch_hold = self._waist_pitch_hold_q
+            roll = self.msg.motor_cmd[G1_29_JointIndex.kWaistRoll]
+            roll.mode = 0
+            roll.kp = 0.0
+            roll.kd = 0.0
+            roll.tau = 0.0
+            pitch = self.msg.motor_cmd[G1_29_JointIndex.kWaistPitch]
+            if bend_enabled:
+                pitch.mode = 0
+                pitch.kp = 0.0
+                pitch.kd = 0.0
+                pitch.tau = 0.0
+            else:
+                pitch.mode = 1
+                pitch.kp = self.kp_high
+                pitch.kd = self.kd_high
+                pitch.q = pitch_hold
+                pitch.dq = 0.0
+                pitch.tau = 0.0
+
             for idx, id in enumerate((self.left_index, self.right_index)):
                 self.msg.motor_cmd[id].mode = 1
                 self.msg.motor_cmd[id].q = gripper_q_cmd[idx]
@@ -573,6 +615,28 @@ class G1_29_Arm_Internal_Dex1_Controller:
             self._policy_gripper_direct = True
             target = np.asarray(self.gripper_q_target, dtype=float).copy()
         return float(target[0]), float(target[1])
+
+    def set_waist_bend_enabled(self, enabled, hold_q=None):
+        """Release waist pitch only while full-body bend is allowed.
+
+        Leaving body mode latches the current angle once. Repeating the lock
+        does not chase the measured angle, so a slow push cannot fold the torso.
+        """
+        enabled = bool(enabled)
+        with self.ctrl_lock:
+            if enabled == self._waist_bend_enabled:
+                return
+        if not enabled and hold_q is None:
+            hold_q = float(self.get_current_motor_q()[G1_29_JointIndex.kWaistPitch])
+        with self.ctrl_lock:
+            if not enabled:
+                self._waist_pitch_hold_q = float(hold_q)
+            self._waist_bend_enabled = enabled
+            locked_q = self._waist_pitch_hold_q
+        if enabled:
+            logger_mp.info("Waist pitch lowcmd released for body mode.")
+        else:
+            logger_mp.info(f"Waist pitch locked at {locked_q:.4f} rad.")
 
     def ctrl_dual_arm(self, q_target, tauff_target):
         q_arr = np.atleast_1d(q_target)

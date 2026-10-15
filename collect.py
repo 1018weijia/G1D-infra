@@ -220,6 +220,10 @@ if __name__ == '__main__':
             try:
                 from teleop.robot_control.waist_pitch import G1D_Mobile_Waist_Pitch_Controller
                 waist_pitch_ctrl = G1D_Mobile_Waist_Pitch_Controller(arm_ctrl)
+                waist_pitch_ctrl.set_button_reader(lambda: (
+                    bool(tv_wrapper.tvuer.right_ctrl_bButton),
+                    bool(tv_wrapper.tvuer.right_ctrl_aButton),
+                ))
             except Exception as e:
                 STOP = True
                 logger_mp.error(f"Failed to initialize waist pitch controller: {e}")
@@ -328,6 +332,18 @@ if __name__ == '__main__':
                         publish_reset_category(1, reset_pose_publisher)
 
             follow_xr = (not PAUSED)
+            if waist_pitch_ctrl is not None:
+                # Before IK. The pitch thread samples A/B at 200 Hz from here on,
+                # so a slow solve cannot drop a held bend/raise button.
+                honor_waist_buttons = follow_xr and controller_shortcuts.mode == "body"
+                waist_pitch_ctrl.set_honor_buttons(honor_waist_buttons)
+                if honor_waist_buttons:
+                    arm_ctrl.set_waist_bend_enabled(True)
+                else:
+                    waist_pitch_ctrl.set_waist_pitch_buttons(button_bend=False, button_raise=False)
+                    arm_ctrl.set_waist_bend_enabled(
+                        False, hold_q=waist_pitch_ctrl.get_current_waist_pitch_state(),
+                    )
             if follow_xr and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
@@ -396,13 +412,6 @@ if __name__ == '__main__':
                     waist_action = np.array([control_data_mapper.current_waist_yaw_pos], dtype=float)
                 live_q = np.concatenate([live_q, waist_action])
                 if waist_pitch_ctrl is not None:
-                    if follow_xr and body_mode:
-                        waist_pitch_ctrl.set_waist_pitch_buttons(
-                            button_bend=bool(getattr(tele_data, "right_ctrl_bButton", False)),
-                            button_raise=bool(getattr(tele_data, "right_ctrl_aButton", False)),
-                        )
-                    else:
-                        waist_pitch_ctrl.set_waist_pitch_buttons(button_bend=False, button_raise=False)
                     waist_pitch_state = [waist_pitch_ctrl.get_current_waist_pitch_state()]
                     waist_pitch_action = [waist_pitch_ctrl.get_current_waist_pitch_action()]
 
@@ -619,7 +628,16 @@ if __name__ == '__main__':
     finally:
         try:
             if waist_pitch_ctrl is not None:
-                waist_pitch_ctrl.close()
+                try:
+                    # Home runs on rt/waistpitchcmd, so lowcmd has to let go first.
+                    # Lock again once that publisher stops, or the joint goes limp
+                    # while the arms move home.
+                    arm_ctrl.set_waist_bend_enabled(True)
+                    waist_pitch_ctrl.close()
+                finally:
+                    arm_ctrl.set_waist_bend_enabled(
+                        False, hold_q=waist_pitch_ctrl.get_current_waist_pitch_state(),
+                    )
         except Exception as e:
             logger_mp.error(f"Failed to home and stop waist pitch controller: {e}")
 
