@@ -16,6 +16,7 @@ TASK_GOAL="${TASK_GOAL:-$G1D_TASK_GOAL}"
 
 cd "$REPO_ROOT"
 export UNITREE_DDSINTERFACE="$DDS_INTERFACE"
+# Waist bend/yaw stays off unless the caller adds --use-waist.
 python collect.py \
   --ee dex1_internal \
   --input-mode "$INPUT_MODE" \

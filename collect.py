@@ -152,6 +152,7 @@ if __name__ == '__main__':
         logger_mp.error("%s", lock_error)
         sys.exit(1)
 
+    waist_pitch_ctrl = None
     try:
         if args.sim:
             ChannelFactoryInitialize(1, networkInterface=args.network_interface)
@@ -215,6 +216,18 @@ if __name__ == '__main__':
             mobile_ctrl=None
         control_data_mapper = ControlDataMapper(arm_ctrl.get_current_waist_q()[0])
         handle_instruction = HandleInstruction(args.input_mode == "hand", tv_wrapper, mobile_ctrl)
+        if args.use_waist:
+            try:
+                from teleop.robot_control.waist_pitch import G1D_Mobile_Waist_Pitch_Controller
+                waist_pitch_ctrl = G1D_Mobile_Waist_Pitch_Controller(arm_ctrl)
+                waist_pitch_ctrl.set_button_reader(lambda: (
+                    bool(tv_wrapper.tvuer.right_ctrl_bButton),
+                    bool(tv_wrapper.tvuer.right_ctrl_aButton),
+                ))
+            except Exception as e:
+                STOP = True
+                logger_mp.error(f"Failed to initialize waist pitch controller: {e}")
+                raise
 
         # simulation mode
         if args.sim:
@@ -257,7 +270,14 @@ if __name__ == '__main__':
         if not STOP:
             logger_mp.info("Please enter the start signal (enter 'r' to start the subsequent program)")
             logger_mp.info("Controller shortcuts: right A=start/pause/resume, left Y=record toggle, left X=fail-stop, right B=quit")
-        controller_shortcuts = ControllerShortcutMapper(on_press, get_state)
+            if args.use_waist:
+                logger_mp.info(
+                    "Waist enabled, arm mode. Click the right stick (press down until it clicks, do not tilt it) "
+                    "to enter body mode: hold B to bend, hold A to straighten, stick left/right to yaw."
+                )
+        controller_shortcuts = ControllerShortcutMapper(
+            on_press, get_state, waist_enabled=args.use_waist,
+        )
         last_sol_q = None
         last_sol_tauff = None
         held_sol_q = None
@@ -312,6 +332,18 @@ if __name__ == '__main__':
                         publish_reset_category(1, reset_pose_publisher)
 
             follow_xr = (not PAUSED)
+            if waist_pitch_ctrl is not None:
+                # Before IK. The pitch thread samples A/B at 200 Hz from here on,
+                # so a slow solve cannot drop a held bend/raise button.
+                honor_waist_buttons = follow_xr and controller_shortcuts.mode == "body"
+                waist_pitch_ctrl.set_honor_buttons(honor_waist_buttons)
+                if honor_waist_buttons:
+                    arm_ctrl.set_waist_bend_enabled(True)
+                else:
+                    waist_pitch_ctrl.set_waist_pitch_buttons(button_bend=False, button_raise=False)
+                    arm_ctrl.set_waist_bend_enabled(
+                        False, hold_q=waist_pitch_ctrl.get_current_waist_pitch_state(),
+                    )
             if follow_xr and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
@@ -342,6 +374,8 @@ if __name__ == '__main__':
             move_action = [0.0, 0.0]
             waist_state = None
             waist_action = None
+            waist_pitch_state = None
+            waist_pitch_action = None
             if mobile_ctrl is not None:
                 height_state = mobile_ctrl.g1_height_state_array_out
                 if follow_xr:
@@ -365,16 +399,21 @@ if __name__ == '__main__':
 
             if args.use_waist:
                 waist_state = arm_ctrl.get_current_waist_q()
-                if follow_xr:
+                body_mode = controller_shortcuts.mode == "body"
+                # Always send a yaw command while waist control is on. Leaving it at the
+                # zero default would rotate the yaw motor home during arm mode.
+                if follow_xr and body_mode:
                     handle_instruction_data = handle_instruction.get_instruction()
-                    vel_data = control_data_mapper.update(rx=handle_instruction_data['rx'], current_waist_yaw=waist_state[0])
+                    vel_data = control_data_mapper.update(
+                        rx=handle_instruction_data['rx'], current_waist_yaw=waist_state[0],
+                    )
                     waist_action = np.array([vel_data['waist_yaw_pos']], dtype=float)
-                    live_q = np.concatenate([live_q, waist_action])
-                elif held_sol_q is not None and np.asarray(held_sol_q).size > 14:
-                    waist_action = np.asarray(held_sol_q, dtype=float)[14:15]
                 else:
-                    waist_action = np.asarray(waist_state[:1], dtype=float)
-                    live_q = np.concatenate([live_q, waist_action])
+                    waist_action = np.array([control_data_mapper.current_waist_yaw_pos], dtype=float)
+                live_q = np.concatenate([live_q, waist_action])
+                if waist_pitch_ctrl is not None:
+                    waist_pitch_state = [waist_pitch_ctrl.get_current_waist_pitch_state()]
+                    waist_pitch_action = [waist_pitch_ctrl.get_current_waist_pitch_action()]
 
             if PAUSED:
                 if held_sol_q is None:
@@ -562,6 +601,13 @@ if __name__ == '__main__':
                         actions["waist"] = {
                             "qpos": waist_action.tolist(),  # [yaw]
                         }
+                    if waist_pitch_state is not None and waist_pitch_action is not None:
+                        states["waist_pitch"] = {
+                            "qpos": waist_pitch_state,  # [pitch]
+                        }
+                        actions["waist_pitch"] = {
+                            "qpos": waist_pitch_action,  # [pitch]
+                        }
 
                     if args.sim:
                         sim_state = sim_state_subscriber.read_data()            
@@ -580,6 +626,21 @@ if __name__ == '__main__':
     except Exception as e:
         logger_mp.error(f"Error: {e}")
     finally:
+        try:
+            if waist_pitch_ctrl is not None:
+                try:
+                    # Home runs on rt/waistpitchcmd, so lowcmd has to let go first.
+                    # Lock again once that publisher stops, or the joint goes limp
+                    # while the arms move home.
+                    arm_ctrl.set_waist_bend_enabled(True)
+                    waist_pitch_ctrl.close()
+                finally:
+                    arm_ctrl.set_waist_bend_enabled(
+                        False, hold_q=waist_pitch_ctrl.get_current_waist_pitch_state(),
+                    )
+        except Exception as e:
+            logger_mp.error(f"Failed to home and stop waist pitch controller: {e}")
+
         try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:

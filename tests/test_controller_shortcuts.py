@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from teleop.utils.controller_shortcuts import ControllerShortcutMapper, toggle_start_pause
+from teleop.utils.controller_shortcuts import MODE_ARM, MODE_BODY, ControllerShortcutMapper, toggle_start_pause
 
 
 def tele(**kwargs):
@@ -135,6 +135,58 @@ class ControllerShortcutMapperTest(unittest.TestCase):
     def test_right_b_requests_exit(self):
         self.assertEqual(self.mapper.update(tele(right_ctrl_bButton=True)), ["q"])
         self.assertTrue(self.session.state["STOP"])
+
+
+class WaistModeShortcutTest(unittest.TestCase):
+    def setUp(self):
+        self.session = FakeSession()
+        self.mapper = ControllerShortcutMapper(
+            self.session.on_press, self.session.get_state, waist_enabled=True,
+        )
+
+    def test_defaults_to_arm_mode(self):
+        self.assertEqual(self.mapper.mode, MODE_ARM)
+
+    def test_stick_click_toggles_without_session_key(self):
+        self.assertEqual(self.mapper.update(tele(right_ctrl_thumbstick=True)), [])
+        self.assertEqual(self.mapper.mode, MODE_BODY)
+        self.assertEqual(self.session.keys, [])
+        self.assertEqual(self.mapper.update(tele(right_ctrl_thumbstick=True)), [])
+        self.assertEqual(self.mapper.mode, MODE_BODY)
+        self.mapper.update(tele())
+        self.assertEqual(self.mapper.update(tele(right_ctrl_thumbstick=True)), [])
+        self.assertEqual(self.mapper.mode, MODE_ARM)
+
+    def test_body_mode_holds_ab_off_session_keys(self):
+        self.mapper.update(tele(right_ctrl_thumbstick=True))
+        self.mapper.update(tele())
+        self.assertEqual(self.mapper.update(tele(right_ctrl_aButton=True, right_ctrl_bButton=True)), [])
+        self.assertEqual(self.session.keys, [])
+        self.assertFalse(self.session.state["START"])
+        self.assertFalse(self.session.state["STOP"])
+
+    def test_arm_mode_ab_still_start_and_quit(self):
+        self.assertEqual(self.mapper.update(tele(right_ctrl_aButton=True)), ["r"])
+        self.mapper.update(tele())
+        self.assertEqual(self.mapper.update(tele(right_ctrl_bButton=True)), ["q"])
+        self.assertTrue(self.session.state["STOP"])
+
+    def test_left_yx_work_in_body_mode(self):
+        self.session.state["START"] = True
+        self.session.state["RECORD_RUNNING"] = True
+        self.mapper.update(tele(right_ctrl_thumbstick=True))
+        self.mapper.update(tele())
+        self.assertEqual(self.mapper.mode, MODE_BODY)
+        self.assertEqual(self.mapper.update(tele(left_ctrl_bButton=True)), ["s"])
+        self.mapper.update(tele())
+        self.session.state["RECORD_TOGGLE"] = False
+        self.assertEqual(self.mapper.update(tele(left_ctrl_aButton=True)), ["f"])
+
+    def test_stick_click_ignored_when_waist_disabled(self):
+        mapper = ControllerShortcutMapper(self.session.on_press, self.session.get_state)
+        self.assertEqual(mapper.update(tele(right_ctrl_thumbstick=True)), [])
+        self.assertEqual(mapper.mode, MODE_ARM)
+        self.assertEqual(mapper.update(tele(right_ctrl_aButton=True)), ["r"])
 
 
 if __name__ == "__main__":
