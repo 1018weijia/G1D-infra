@@ -37,7 +37,7 @@ from teleop.utils.ego_projection import EgoPixelOverlay
 from teleop.utils.episode_writer import EpisodeWriter
 from teleop.utils.handoff_utils import rollback_endpoint_to_xr_targets
 from teleop.utils.intervention_log import InterventionLogger
-from teleop.utils.policy_client import PolicyAdapter, PolicyRemoteClient
+from teleop.utils.policy_client import EefActionChunk, PolicyAdapter, PolicyRemoteClient
 from teleop.utils.policy_handoff import (
     A_GAP_S,
     A_HANDOFF_DEBOUNCE_S,
@@ -202,7 +202,7 @@ def _start_policy_from_current_pose(
     """Capture the current robot pose and request the next policy chunk."""
     resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
     resume_left_grip, resume_right_grip = _read_grippers(arm_ctrl)
-    resume_request = _prepare_policy_request(adapter, img_client, arm_ctrl)
+    resume_request = _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik)
     with inference_lock:
         inference_state["result"] = None
         inference_state["error"] = None
@@ -232,8 +232,12 @@ def _write_xr_grippers(left_gripper_value, right_gripper_value, tele_data, input
         _write_controller_grippers(left_gripper_value, right_gripper_value, tele_data)
 
 
-def _prepare_policy_request(adapter, img_client, arm_ctrl):
-    """Capture one observation in the main loop without contacting the cloud."""
+def _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik):
+    """Capture one observation in the main loop without contacting the cloud.
+
+    The eef policy takes the current hand poses as its anchor, so send the same
+    waist-frame poses the arm IK solves against.
+    """
     current_arm_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
     left_grip, right_grip = _read_grippers(arm_ctrl)
     head_img = img_client.get_head_frame()
@@ -245,6 +249,9 @@ def _prepare_policy_request(adapter, img_client, arm_ctrl):
         head_img.bgr, left_wrist_img.bgr, right_wrist_img.bgr,
         current_arm_q, left_grip, right_grip,
     )
+    left_pose, right_pose = arm_ik.solve_fk_matrix(np.asarray(current_arm_q, dtype=float))
+    observation.eef_left = np.asarray(left_pose, dtype=np.float64)
+    observation.eef_right = np.asarray(right_pose, dtype=np.float64)
     return observation, current_arm_q
 
 
@@ -252,6 +259,10 @@ def _predict_policy_queue(adapter, remote, request, instruction):
     """Run the blocking cloud request; intended for the inference worker only."""
     observation, current_arm_q = request
     actions, predict_ms = remote.predict(observation, instruction)
+    if isinstance(actions, EefActionChunk):
+        queue = adapter.build_eef_queue(actions)
+        logger_mp.info("Policy eef chunk received: predict=%.1fms queue=%d", predict_ms, len(queue))
+        return queue
     queue = adapter.build_exec_queue(actions, current_arm_q)
     logger_mp.info("Policy chunk received: predict=%.1fms queue=%d", predict_ms, len(queue))
     return queue
@@ -856,15 +867,26 @@ if __name__ == "__main__":
                     policy_inference_enabled = True
                 step = action_queue.pop(0) if action_queue else None
                 if step is not None:
-                    sol_q = step.arm_q
-                    sol_tauff = arm_ik.solve_tau(sol_q)
+                    if step.left_pose is not None:
+                        sol_q, sol_tauff = arm_ik.solve_ik(
+                            np.asarray(step.left_pose, dtype=float),
+                            np.asarray(step.right_pose, dtype=float),
+                            np.asarray(current_lr_arm_q[:14], dtype=float),
+                        )
+                        sol_q = np.asarray(sol_q, dtype=float).reshape(-1)[:14]
+                        sol_tauff = np.asarray(sol_tauff, dtype=float).reshape(-1)[:14]
+                        if not arm_ik.last_solve_succeeded:
+                            logger_mp.warning("local IK did not converge; holding the previous arm command")
+                    else:
+                        sol_q = step.arm_q
+                        sol_tauff = arm_ik.solve_tau(sol_q)
                     cmd_left_grip = step.left_grip
                     cmd_right_grip = step.right_grip
                 if (policy_inference_enabled and
                         len(action_queue) <= args.policy_prefetch_steps and
                         not worker_busy):
                     try:
-                        request = _prepare_policy_request(adapter, img_client, arm_ctrl)
+                        request = _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik)
                         if not start_inference(request):
                             logger_mp.debug("Policy inference worker is still busy.")
                     except Exception as request_error:

@@ -31,6 +31,17 @@ class PolicyObservation:
     state: np.ndarray
     first_frame: Optional[np.ndarray] = None
     images: Optional[dict] = None
+    eef_left: Optional[np.ndarray] = None
+    eef_right: Optional[np.ndarray] = None
+
+
+@dataclass
+class EefActionChunk:
+    """Hand poses in the G1 IK waist frame, plus Dex1 gripper commands."""
+
+    left_pose: np.ndarray
+    right_pose: np.ndarray
+    grippers: np.ndarray
 
 
 def build_zmq_request(observation: PolicyObservation, instruction: str) -> dict:
@@ -48,11 +59,20 @@ def build_zmq_request(observation: PolicyObservation, instruction: str) -> dict:
         if observation.first_frame is None:
             raise ValueError("stitched observation is missing first_frame")
         request["first_frame"] = np.asarray(observation.first_frame)
-        return request
+        return _attach_eef(request, observation)
     images = observation.images or {}
     if not images:
         raise ValueError("separate observation is missing images")
     request["images"] = {name: np.asarray(image) for name, image in images.items()}
+    return _attach_eef(request, observation)
+
+
+def _attach_eef(request: dict, observation: PolicyObservation) -> dict:
+    """Add waist-frame hand poses when measured; the eef policy needs them as anchor."""
+    if observation.eef_left is None or observation.eef_right is None:
+        return request
+    request["eef_left"] = np.asarray(observation.eef_left, dtype=np.float64)
+    request["eef_right"] = np.asarray(observation.eef_right, dtype=np.float64)
     return request
 
 
@@ -322,6 +342,12 @@ class PolicyRemoteClient:
             raise RuntimeError(f"ZMQ inference failed: {last_err}") from last_err
         if resp.get("status") != "ok":
             raise RuntimeError(f"ZMQ server error: {resp.get('message', 'unknown')}")
+        if resp.get("action_kind") == "eef":
+            return EefActionChunk(
+                left_pose=np.asarray(resp["left_pose"], dtype=np.float64),
+                right_pose=np.asarray(resp["right_pose"], dtype=np.float64),
+                grippers=np.asarray(resp["grippers"], dtype=np.float64),
+            ), float(resp.get("predict_ms", 0.0))
         return self._finalize_actions(resp["actions"], resp.get("predict_ms", 0.0))
 
     def predict(self, observation, instruction):
@@ -377,6 +403,8 @@ class PolicyExecStep:
     arm_q: np.ndarray
     left_grip: float
     right_grip: float
+    left_pose: Optional[np.ndarray] = None
+    right_pose: Optional[np.ndarray] = None
 
 
 class PolicyAdapter:
@@ -554,6 +582,31 @@ class PolicyAdapter:
         for dim in range(dims):
             interpolated[:, dim] = np.interp(target, source, actions[:, dim])
         return interpolated
+
+    def build_eef_queue(self, chunk: EefActionChunk):
+        """One IK target per cloud pose; rotations are not interpolated."""
+        left = np.asarray(chunk.left_pose, dtype=float)
+        right = np.asarray(chunk.right_pose, dtype=float)
+        grips = np.asarray(chunk.grippers, dtype=float)
+        if left.ndim != 3 or left.shape[1:] != (4, 4) or right.shape != left.shape:
+            raise ValueError(f"expected left/right (T, 4, 4), got {left.shape} {right.shape}")
+        if grips.shape != (left.shape[0], 2) or not (
+            np.all(np.isfinite(left)) and np.all(np.isfinite(right)) and np.all(np.isfinite(grips))
+        ):
+            raise ValueError(f"expected finite poses and grippers (T, 2), got {grips.shape}")
+        rows = left.shape[0]
+        if 0 < self.exec_chunk_steps < rows:
+            rows = self.exec_chunk_steps
+        queue = []
+        for index in range(rows):
+            queue.append(PolicyExecStep(
+                arm_q=np.zeros(14, dtype=float),
+                left_grip=float(grips[index, 0]),
+                right_grip=float(grips[index, 1]),
+                left_pose=left[index].copy(),
+                right_pose=right[index].copy(),
+            ))
+        return queue
 
     def build_exec_queue(self, raw_actions, current_arm_q):
         raw_actions = validate_action_chunk(raw_actions, previous_arm_q=current_arm_q)
