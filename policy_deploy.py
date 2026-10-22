@@ -357,7 +357,8 @@ if __name__ == "__main__":
         "--ready-pose-seconds", type=float, default=3.0,
         help="seconds to move from the current pose to the raised startup pose",
     )
-    parser.add_argument("--swap-wrists", action="store_true", default=True)
+    parser.add_argument("--swap-wrists", action="store_true", default=False,
+                        help="Swap wrist images; only needed if a camera is wired to the wrong arm")
     parser.add_argument("--no-swap-wrists", action="store_false", dest="swap_wrists")
     parser.add_argument(
         "--input-mode",

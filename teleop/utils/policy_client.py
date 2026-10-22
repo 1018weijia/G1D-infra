@@ -405,7 +405,7 @@ class PolicyAdapter:
         self.action_interp_factor = max(1, int(action_interp_factor))
         self.exec_chunk_steps = max(0, int(exec_chunk_steps))
         self.swap_wrists = (
-            os.environ.get("SWAP_WRISTS", "1") != "0"
+            os.environ.get("SWAP_WRISTS", "0") != "0"
             if swap_wrists is None else bool(swap_wrists)
         )
 

@@ -1,4 +1,16 @@
 # =====================================================
+# Global WebRTC encoder config (applies to ALL cameras).
+# aiortc bitrate caps are module-level, so this is shared by every track.
+# Tune by network: WiFi6 5GHz dedicated -> max ~12M; WiFi5 shared -> max ~8M; public -> max ~4M.
+# =====================================================
+webrtc:
+  bitrate:
+    min: 2000000      # floor under congestion
+    default: 5000000  # startup rate, skips slow-start
+    max: 8000000      # quality ceiling on healthy network
+  gop_length: 60      # frames between keyframes; lower = faster recovery from packet loss
+
+# =====================================================
 # Head camera configuration
 # =====================================================
 # camera topic
@@ -44,7 +56,7 @@ head_camera:
   #   - type "opencv":    supports video_id, serial_number, physical_path
   #   - type "uvc":       supports video_id, serial_number, physical_path
   video_id: 0
-  serial_number: 01.00.00
+  serial_number: "01.00.00"
   physical_path: null
 
 # =====================================================
@@ -60,8 +72,8 @@ left_wrist_camera:
   image_shape: [480, 640]
   binocular: false
   fps: 30
-  video_id: 2
-  serial_number: 200901010001
+  video_id: 4
+  serial_number: "JR0002"
   physical_path: null
 
 # =====================================================
@@ -77,6 +89,6 @@ right_wrist_camera:
   image_shape: [480, 640]
   binocular: false
   fps: 30
-  video_id: 4
-  serial_number: 200901010002
+  video_id: 2
+  serial_number: "JR0001"
   physical_path: null

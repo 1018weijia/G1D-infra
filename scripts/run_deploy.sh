@@ -30,7 +30,7 @@ TUNNEL_WAIT_SECONDS="${TUNNEL_WAIT_SECONDS:-60}"
 DRY_RUN=0
 
 export PAD_JOINT_VALUES="${PAD_JOINT_VALUES-}"
-export SWAP_WRISTS="${SWAP_WRISTS:-1}"
+export SWAP_WRISTS="${SWAP_WRISTS:-0}"
 
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1

@@ -57,17 +57,38 @@ VECTOR_GROUPS = (
 )
 
 # Physical cameras on this binocular-head G1.
-# teleop_hand_and_arm.py writes color_2 from left_wrist_img and color_3 from
-# right_wrist_img, and unitree_lerobot.constants copies that software naming.
-# The recorded images show those two wrist streams are swapped vs the real
-# hands, so this converter maps by what the cameras actually see:
-#   color_0 left eye, color_1 right eye, color_2 right wrist, color_3 left wrist.
+# collect.py writes color_2 from left_wrist_img and color_3 from
+# right_wrist_img, and the wrist camera config binds left_wrist_camera to the
+# physical left wrist, so the slot names are truthful:
+#   color_0 left eye, color_1 right eye, color_2 left wrist, color_3 right wrist.
 CAMERA_TO_IMAGE_KEY = {
+    "color_0": "cam_left_high",
+    "color_1": "cam_right_high",
+    "color_2": "cam_left_wrist",
+    "color_3": "cam_right_wrist",
+}
+
+# Cameras were bound to the opposite arms before this date, so those episodes
+# stored the right wrist in color_2. Both mappings yield the same feature
+# names; only which wrist lands in which feature differs.
+WRIST_FIX_DATE = "2026-10-22"
+LEGACY_CAMERA_TO_IMAGE_KEY = {
     "color_0": "cam_left_high",
     "color_1": "cam_right_high",
     "color_2": "cam_right_wrist",
     "color_3": "cam_left_wrist",
 }
+
+
+def camera_mapping_for_episode(episode_data: dict) -> dict[str, str]:
+    """Slot -> feature mapping for one episode, chosen by its recording date.
+
+    Only a dated pre-fix episode gets the swap; an undated one is treated as
+    current, since every episode recorded before the fix carries a date.
+    """
+    date = (episode_data.get("info") or {}).get("date") or ""
+    legacy = bool(date) and date < WRIST_FIX_DATE
+    return dict(LEGACY_CAMERA_TO_IMAGE_KEY if legacy else CAMERA_TO_IMAGE_KEY)
 
 
 def load_json(path: Path):
@@ -614,6 +635,7 @@ def convert(args: argparse.Namespace) -> None:
             samples = episode_data["data"]
             task = args.task or episode_data.get("text", {}).get("goal") or raw_dir.name
             src_index = source_id if source_id is not None else converted
+            episode_mapping = camera_mapping_for_episode(episode_data)
 
             for sample in tqdm(samples, desc=episode_dir.name, leave=False):
                 frame = extract_frame_vectors(sample, vector_dims)
@@ -630,7 +652,7 @@ def convert(args: argparse.Namespace) -> None:
                         episode_dir,
                         sample.get("colors") or {},
                         features,
-                        CAMERA_TO_IMAGE_KEY,
+                        episode_mapping,
                         image_pool,
                     )
                 )
