@@ -86,6 +86,10 @@ def build_parser():
     parser.add_argument('--yes', action='store_true', help="skip the confirmation prompt")
     parser.add_argument('--no-go-home', action='store_true',
                         help="hold the last pose instead of returning to home")
+    parser.add_argument('--release-seconds', type=float, default=5.0,
+                        help="fade arm stiffness out over this many seconds on exit (0 to skip)")
+    parser.add_argument('--gripper-open-seconds', type=float, default=1.5,
+                        help="open both grippers over this many seconds on exit (0 to skip)")
     parser.add_argument('--network-interface', type=str, default=os.environ.get("UNITREE_DDSINTERFACE"),
                         help="DDS interface, e.g. eth0")
     return parser
@@ -269,6 +273,21 @@ def main():
                 arm_ctrl.ctrl_dual_arm_go_home()
             except Exception as exc:
                 logger_mp.error(f"[replay] go home failed: {exc}")
+        # Park the jaws open and fade the stiffness before this process stops
+        # publishing. Without the fade the arms drop in the first tick after exit;
+        # without the jaw reset the robot stays parked with whatever grip the
+        # episode ended on.
+        try:
+            if args.gripper_open_seconds > 0:
+                logger_mp.info("[replay] opening both grippers before release")
+                arm_ctrl.open_grippers(seconds=args.gripper_open_seconds)
+        except Exception as exc:
+            logger_mp.error(f"[replay] failed to open grippers: {exc}")
+        try:
+            if args.release_seconds > 0:
+                arm_ctrl.release_stiffness(seconds=args.release_seconds)
+        except Exception as exc:
+            logger_mp.error(f"[replay] failed to release arm stiffness: {exc}")
 
     logger_mp.info(f"[replay] finished {completed}/{args.loop} pass(es)")
     return 0

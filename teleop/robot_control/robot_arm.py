@@ -396,6 +396,9 @@ class G1_29_Arm_Internal_Dex1_Controller:
         self.kd_wrist = 1.5
         self.gripper_kp = 5.0
         self.gripper_kd = 0.05
+        # 1.0 = full stiffness. release_stiffness() walks this down to 0 so shutting
+        # down fades the arms out instead of dropping them in a single 4 ms tick.
+        self._kp_scale = 1.0
 
         from teleop.utils.weighted_moving_filter import WeightedMovingFilter
         self.smooth_filter = WeightedMovingFilter(np.array([0.5, 0.3, 0.2]), 2)
@@ -550,6 +553,13 @@ class G1_29_Arm_Internal_Dex1_Controller:
             with self.ctrl_lock:
                 bend_enabled = self._waist_bend_enabled
                 pitch_hold = self._waist_pitch_hold_q
+                kp_scale = self._kp_scale
+            # Arms fade with release_stiffness(); kd is deliberately left alone so the
+            # joints keep a damper while the spring is withdrawn.
+            for id in G1_29_Arm_JointIndex:
+                cmd = self.msg.motor_cmd[id]
+                full_kp = self.kp_wrist if self._Is_wrist_motor(id) else self.kp_low
+                cmd.kp = full_kp * kp_scale
             roll = self.msg.motor_cmd[G1_29_JointIndex.kWaistRoll]
             roll.mode = 0
             roll.kp = 0.0
@@ -598,11 +608,85 @@ class G1_29_Arm_Internal_Dex1_Controller:
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
         return current_q + delta / max(motion_scale, 1.0)
 
+    def release_stiffness(self, seconds=5.0, min_kp_ratio=0.0):
+        """Fade arm stiffness out over ``seconds`` instead of dropping it in one tick.
+
+        Stopping rt/lowcmd hands the arms from position control to free fall in a
+        single 4 ms tick: the shoulder was holding kp=80 N.m/rad against the whole
+        forearm, so it snaps down the instant the command stream stops. Ramping
+        ``kp`` down while ``kd`` stays put keeps a light damper on every joint, so
+        the arms sag gently and settle instead of dropping.
+
+        Only arms and wrist are ramped. Waist pitch keeps its stiffness, and the
+        grippers keep holding whatever they were holding.
+        """
+        seconds = max(0.1, float(seconds))
+        ratio = min(1.0, max(0.0, float(min_kp_ratio)))
+        dt = self.control_dt
+        steps = max(1, int(round(seconds / dt)))
+        logger_mp.info(
+            f"[G1_29_Arm_Internal_Dex1_Controller] releasing arm stiffness over {seconds:.1f}s "
+            f"(kp x1.00 -> x{ratio:.2f}, kd unchanged)")
+
+        for step in range(steps + 1):
+            # smoothstep: no jolt at the start, no thump at the end.
+            x = min(1.0, step / steps)
+            ease = x * x * (3.0 - 2.0 * x)
+            scale = 1.0 - (1.0 - ratio) * ease
+            with self.ctrl_lock:
+                self._kp_scale = scale
+            time.sleep(dt)
+
+        with self.ctrl_lock:
+            self._kp_scale = ratio
+        logger_mp.info("[G1_29_Arm_Internal_Dex1_Controller] arm stiffness released")
+
     def set_policy_gripper_q(self, left_q, right_q):
         """Command internal grippers directly during policy rollout."""
         with self.ctrl_lock:
             self.gripper_q_target = np.array([float(left_q), float(right_q)], dtype=float)
             self._policy_gripper_direct = True
+
+    def open_grippers(self, seconds=1.5, open_q=None):
+        """Drive both grippers to the open position before releasing control.
+
+        The startup path already leaves them open, but nothing reopened them on the
+        way out: the grippers simply froze wherever the operator's hands happened
+        to be, so the robot was routinely parked with one hand closed and the other
+        half open. Park them open on exit too, using the same smooth ramp as
+        release_stiffness() so the jaws do not snap.
+        """
+        if open_q is None:
+            from teleop.utils.ready_pose import GRIPPER_OPEN
+            open_q = GRIPPER_OPEN
+        dt = self.control_dt
+        steps = max(1, int(round(max(0.1, float(seconds)) / dt)))
+
+        # Freeze the XR/controller mapping first, otherwise the 250 Hz loop keeps
+        # overwriting gripper_q_target with the live trigger value. Start from the
+        # measured jaw angle, not the latched command: after a policy rollout these
+        # can disagree, and the command would make the jaws jump on the first tick.
+        self.latch_gripper_command()
+        measured = self.get_current_dual_gripper_q()
+        start_left, start_right = float(measured[0]), float(measured[1])
+        target = float(open_q)
+        logger_mp.info(
+            f"[G1_29_Arm_Internal_Dex1_Controller] opening grippers over {seconds:.1f}s "
+            f"({start_left:.2f}/{start_right:.2f} -> {target:.2f})")
+
+        for step in range(steps + 1):
+            x = min(1.0, step / steps)
+            ease = x * x * (3.0 - 2.0 * x)
+            with self.ctrl_lock:
+                self.gripper_q_target = np.array([
+                    start_left + (target - start_left) * ease,
+                    start_right + (target - start_right) * ease,
+                ], dtype=float)
+            time.sleep(dt)
+
+        with self.ctrl_lock:
+            self.gripper_q_target = np.array([target, target], dtype=float)
+        logger_mp.info("[G1_29_Arm_Internal_Dex1_Controller] grippers open")
 
     def clear_policy_gripper_direct(self):
         """Return gripper control to XR/controller mapping."""

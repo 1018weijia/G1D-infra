@@ -138,6 +138,10 @@ if __name__ == '__main__':
     parser.add_argument('--task-goal', type = str, default = 'pick up cube.', help = 'task goal for recording at json file')
     parser.add_argument('--task-desc', type = str, default = 'task description', help = 'task description for recording at json file')
     parser.add_argument('--task-steps', type = str, default = 'step1: do this; step2: do that;', help = 'task steps for recording at json file')
+    parser.add_argument('--release-seconds', type = float, default = 5.0,
+                        help = 'Fade arm stiffness out over this many seconds on exit (0 to skip)')
+    parser.add_argument('--gripper-open-seconds', type = float, default = 1.5,
+                        help = 'Open both grippers over this many seconds before releasing control (0 to skip)')
 
     args = parser.parse_args()
     logger_mp.info(f"args: {args}")
@@ -645,6 +649,21 @@ if __name__ == '__main__':
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
+
+        # Home leaves the arms at zero but still fully stiff, and the grippers at
+        # whatever the operator last squeezed. Park both jaws open first, then fade
+        # the stiffness, then stop publishing.
+        try:
+            if args.gripper_open_seconds > 0:
+                arm_ctrl.open_grippers(seconds=args.gripper_open_seconds)
+        except Exception as e:
+            logger_mp.error(f"Failed to open grippers: {e}")
+
+        try:
+            if args.release_seconds > 0:
+                arm_ctrl.release_stiffness(seconds=args.release_seconds)
+        except Exception as e:
+            logger_mp.error(f"Failed to release arm stiffness: {e}")
         
         try:
             if args.ipc:

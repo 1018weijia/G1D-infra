@@ -385,6 +385,14 @@ if __name__ == "__main__":
     parser.add_argument("--task-desc", type=str, default="policy rollout with rollback handoff")
     parser.add_argument("--task-steps", type=str, default="")
     parser.add_argument(
+        "--release-seconds", type=float, default=5.0,
+        help="Fade arm stiffness out over this many seconds on exit (0 to skip)",
+    )
+    parser.add_argument(
+        "--gripper-open-seconds", type=float, default=1.5,
+        help="Open both grippers over this many seconds before releasing control (0 to skip)",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Bypass arm-owner lock (dangerous if collect/deploy already running)",
     )
@@ -1130,6 +1138,21 @@ if __name__ == "__main__":
                 arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as home_error:
             logger_mp.error("Failed to go home: %s", home_error)
+        # Home leaves the arms at zero but still fully stiff, and the grippers at
+        # whatever the policy last commanded. Park both jaws open first, then fade
+        # the stiffness, then stop publishing.
+        try:
+            if arm_ctrl is not None and args.gripper_open_seconds > 0:
+                arm_ctrl.open_grippers(seconds=args.gripper_open_seconds)
+        except Exception as gripper_error:
+            logger_mp.error("Failed to open grippers: %s", gripper_error)
+        # Fade stiffness before lowcmd goes silent; otherwise the arms drop in the
+        # first control tick after this process exits.
+        try:
+            if arm_ctrl is not None and args.release_seconds > 0:
+                arm_ctrl.release_stiffness(seconds=args.release_seconds)
+        except Exception as release_error:
+            logger_mp.error("Failed to release arm stiffness: %s", release_error)
         try:
             KEY_LISTENER_STOP.set()
             listen_keyboard_thread.join(timeout=1.0)
