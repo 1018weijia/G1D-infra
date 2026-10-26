@@ -25,6 +25,18 @@ kTopicWaistPitchState = "rt/waistpitchstate"
 DEFAULT_URDF = Path(__file__).resolve().parents[2] / "assets" / "g1_D" / "g1_d.urdf"
 
 
+def tracked_pitch_command(target, measured, delta, low, high):
+    """Absolute pitch target, clipped to the joint range and to the lead cap.
+
+    The cap limits how far the command may run ahead of the measured angle, the
+    same guard the button integrator uses, so a replay cannot yank the torso.
+    """
+    target = float(np.clip(float(target), low, high))
+    delta = abs(float(delta))
+    measured = float(measured)
+    return float(np.clip(target, measured - delta, measured + delta))
+
+
 class G1D_WaistPitchGravityFeedforward:
     """Gravity torque on the waist pitch joint, computed from the G1-D URDF.
 
@@ -97,6 +109,13 @@ class G1D_Mobile_Waist_Pitch_Controller:
         self.g1_waist_pitch_action_value_in = Value('d', 0.0, lock=True)
         self.g1_waist_pitch_state_value_out = Value('d', 0.0, lock=True)
         self.g1_waist_pitch_action_value_out = Value('d', 0.0, lock=True)
+        # Replay tracks an absolute angle; button integration stays in charge
+        # until something calls set_q_target().
+        self.g1_waist_pitch_position_mode = Value('b', False, lock=True)
+        self.g1_waist_pitch_position_target = Value('d', 0.0, lock=True)
+        # Set by the control thread once it has published, so a caller can hand
+        # the joint over (see wait_until_publishing).
+        self._first_publish = threading.Event()
         # When set, the 200 Hz thread reads A/B itself. The 30 Hz main loop only
         # flips this, so a slow IK solve cannot freeze a held button at false.
         self.honor_buttons = Value('b', False, lock=True)
@@ -124,6 +143,18 @@ class G1D_Mobile_Waist_Pitch_Controller:
         self.waist_pitch_control_thread.start()
 
         logger_mp.info("Initialize G1D_Mobile_Waist_Pitch_Controller OK!\n")
+
+    def wait_until_publishing(self, timeout=2.0):
+        """Block until the control thread has written at least one command.
+
+        A caller about to take the joint away from rt/lowcmd must know this
+        publisher is live first, otherwise nobody holds the torso.
+        """
+        if not self._first_publish.wait(timeout):
+            raise TimeoutError(
+                f"waist pitch published nothing within {timeout:.1f}s; "
+                "refusing to hand the joint over"
+            )
 
     def _subscribe_waist_pitch_state(self):
         while True:
@@ -178,8 +209,24 @@ class G1D_Mobile_Waist_Pitch_Controller:
         else:
             logger_mp.info("Waist pitch buttons: released, holding")
 
+    def set_q_target(self, q):
+        """Track this absolute pitch. The 200 Hz thread still applies the lead cap.
+
+        Button integration is ignored until clear_q_target().
+        """
+        q = float(q)
+        if not np.isfinite(q):
+            raise ValueError(f"waist pitch target must be finite, got {q}")
+        self.g1_waist_pitch_position_target.value = q
+        self.g1_waist_pitch_position_mode.value = True
+
+    def clear_q_target(self):
+        """Return the pitch joint to button integration."""
+        self.g1_waist_pitch_position_mode.value = False
+
     def ctrl_waist_pitch_go_home(self, tolerance=0.05, timeout=6.0):
         logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] ctrl_waist_pitch_go_home start...")
+        self.clear_q_target()
         self.set_honor_buttons(False)
         self.set_waist_pitch_buttons(button_bend=False, button_raise=True)
         deadline = time.time() + timeout
@@ -196,12 +243,18 @@ class G1D_Mobile_Waist_Pitch_Controller:
         self.set_waist_pitch_buttons(button_bend=False, button_raise=False)
         time.sleep(0.1)  # let the control thread publish the settled command before it stops
 
+    def stop(self):
+        """Stop the pitch thread without homing. Safe to call more than once."""
+        self.running = False
+        thread = getattr(self, "waist_pitch_control_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+
     def close(self):
         try:
             self.ctrl_waist_pitch_go_home()
         finally:
-            self.running = False
-            self.waist_pitch_control_thread.join(timeout=0.5)
+            self.stop()
             logger_mp.info("[G1D_Mobile_Waist_Pitch_Controller] closed.")
 
     def ctrl_g1_waist_pitch(self, q_target):
@@ -232,28 +285,37 @@ class G1D_Mobile_Waist_Pitch_Controller:
                         direction = 0.0
                 else:
                     direction = self.g1_waist_pitch_action_value_in.value
-                self._log_direction(direction)
                 measured = self.g1_waist_pitch_state_value_out.value
-
-                if direction > 0.5:
-                    velocity = self.velocity
-                elif direction < -0.5:
-                    velocity = -self.velocity
+                if self.g1_waist_pitch_position_mode.value:
+                    q_cmd = tracked_pitch_command(
+                        self.g1_waist_pitch_position_target.value,
+                        measured,
+                        self.DELTA_WAIST_PITCH_CMD,
+                        self.min_angle,
+                        self.max_angle,
+                    )
                 else:
-                    velocity = 0.0
+                    self._log_direction(direction)
+                    if direction > 0.5:
+                        velocity = self.velocity
+                    elif direction < -0.5:
+                        velocity = -self.velocity
+                    else:
+                        velocity = 0.0
 
-                q_target = np.clip(q_cmd + velocity * dt, self.min_angle, self.max_angle)
-                q_cmd = np.clip(
-                    q_target,
-                    measured - self.DELTA_WAIST_PITCH_CMD,
-                    measured + self.DELTA_WAIST_PITCH_CMD,
-                )
+                    q_target = np.clip(q_cmd + velocity * dt, self.min_angle, self.max_angle)
+                    q_cmd = np.clip(
+                        q_target,
+                        measured - self.DELTA_WAIST_PITCH_CMD,
+                        measured + self.DELTA_WAIST_PITCH_CMD,
+                    )
 
                 self.g1_waist_pitch_msg.tau = float(self.gravity_ff.compute(
                     np.concatenate(([measured], self.arm_ctrl.get_current_dual_arm_q()))
                 ))
                 self.ctrl_g1_waist_pitch(q_cmd)
                 self.g1_waist_pitch_action_value_out.value = q_cmd
+                self._first_publish.set()
 
                 current_time = time.time()
                 time_elapsed = current_time - self.start_time
