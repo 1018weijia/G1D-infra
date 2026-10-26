@@ -22,10 +22,10 @@ def arm_block(values):
     return {"qpos": [float(v) for v in values], "qvel": [], "torque": []}
 
 
-def frame_payload(step, total):
+def frame_payload(step, total, include_waist=False):
     phase = 2.0 * np.pi * step / max(total, 1)
     arm = 0.3 * np.sin(phase + np.arange(7) * 0.1)
-    return (
+    states, actions = (
         {
             "left_arm": arm_block(arm),
             "right_arm": arm_block(-arm),
@@ -49,6 +49,15 @@ def frame_payload(step, total):
             "chassis": {"qvel": [0.0, 0.0]},
         },
     )
+    if include_waist:
+        # Same split collect.py writes: yaw alone, bend in its own group.
+        yaw = 0.2 * np.sin(phase)
+        pitch = 0.4 * (1.0 - np.cos(phase))
+        states["waist"] = {"qpos": [float(yaw)]}
+        actions["waist"] = {"qpos": [float(yaw)]}
+        states["waist_pitch"] = {"qpos": [float(pitch)]}
+        actions["waist_pitch"] = {"qpos": [float(pitch)]}
+    return states, actions
 
 
 def fake_image(step, camera_idx, width, height):
@@ -75,6 +84,10 @@ def main():
     parser.add_argument("--width", type=int, default=320)
     parser.add_argument("--height", type=int, default=240)
     parser.add_argument("--fail", default="", help="episode indices to mark failed, e.g. 1 or 0,2")
+    parser.add_argument(
+        "--waist", action="store_true",
+        help="also write waist.qpos (yaw) and waist_pitch.qpos (bend), as collect.py --use-waist does",
+    )
     args = parser.parse_args()
 
     failed = {int(x) for x in args.fail.replace(",", " ").split()}
@@ -92,7 +105,7 @@ def main():
             if not recorder.create_episode():
                 raise RuntimeError("create_episode refused; writer is busy")
             for step in range(args.frames):
-                states, actions = frame_payload(step, args.frames)
+                states, actions = frame_payload(step, args.frames, include_waist=args.waist)
                 colors = {
                     name: fake_image(step, idx, args.width, args.height)
                     for idx, name in enumerate(CAMERAS)

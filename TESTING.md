@@ -276,7 +276,26 @@ python -m teleop.replay --data-json /tmp/g1d_fake/fake_task/episode_0001 --dry-r
 
 - `episode_0000`：`label   : success`、`checks  : ok`、结尾 `dry run, robot untouched`。
 - `episode_0001`：`label   : this episode is marked FAILED`。
-- 两条都是 `frames  : 20`、`playback: 30.0 Hz`。
+- 两条都是 `frames  : 20`、`playback: 30.0 Hz`，并且有一行 `waist    : not in this episode`（这批假数据没有腰）。
+
+带腰的假数据另写一份，不影响上面这批：
+
+```bash
+python tests/make_fake_episodes.py --task-dir /tmp/g1d_fake/waist_task --episodes 1 --frames 20 --waist
+python -m teleop.replay --data-json /tmp/g1d_fake/waist_task/episode_0000 --dry-run
+```
+
+**成功标志**：摘要有 `waist yaw` 和 `waist pitch`，没有 `not in this episode`，`checks  : ok`。
+
+混用目录会被拒绝，验证方式：
+
+```bash
+python tests/make_fake_episodes.py --task-dir /tmp/g1d_fake/mixed_task --episodes 1 --frames 20
+python tests/make_fake_episodes.py --task-dir /tmp/g1d_fake/mixed_task --episodes 1 --frames 20 --waist
+./data_convert/convert.sh --raw-dir /tmp/g1d_fake/mixed_task --output-dir /tmp/g1d_fake/mixed_out
+```
+
+**成功标志**：报 `Input mixes episodes with and without waist fields` 并点名哪几条有、哪几条没有；`mixed_out` 不会生成。
 
 再确认坏数据会被挡下来：
 

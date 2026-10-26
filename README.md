@@ -8,7 +8,7 @@ G1-D 上的单人数采、LeRobot 转换上传，以及 policy 部署（回退�
 |---|---|
 | `collect.py` / `scripts/run_collect.sh` | XR 遥操作录制 episode（默认录制，`--no-record` 关闭） |
 | `policy_deploy.py` / `scripts/run_deploy.sh` | 云端 policy 推理；键盘 B 回退；对齐后手柄 A 接管，再按 A 停住，键盘 S 恢复 |
-| `teleop.replay` / `scripts/run_replay.sh` | 开环重放一条 episode 的双臂和夹爪 |
+| `teleop.replay` / `scripts/run_replay.sh` | 开环重放一条 episode 的双臂、夹爪；录了腰就连转腰和弯腰一起放 |
 | `scripts/stop_control.sh` | 检测是否有程序在控制机械臂；有的话询问 y/n，y 则按正确信号结束它并复检；退出时张夹爪并缓释刚度 |
 
 ```text
@@ -66,7 +66,7 @@ git submodule update --init --recursive
 超时不退出默认也不强杀，需要时加 `--force`。
 
 退出时的缓释：`collect.py`、`policy_deploy.py` 和 `teleop/replay.py` 在退出时都会按同一顺序收尾：
-`ctrl_dual_arm_go_home()`（replay 还先 hold 最后一帧 1 秒）→ `arm_ctrl.open_grippers()`
+`ctrl_dual_arm_go_home()`（replay 还先 hold 最后一帧 1 秒；轨迹含弯腰时先在 `rt/waistpitchcmd` 上把弯腰回零并重新锁住）→ `arm_ctrl.open_grippers()`
 用 1.5 秒把两个夹爪张到 `GRIPPER_OPEN` → `arm_ctrl.release_stiffness()` 用 5 秒把手臂各关节的
 `kp` 按 smoothstep 从满刚度降到 0（`kd` 保持不动，所以关节仍有阻尼）→ 停止发布 `rt/lowcmd`。
 这样手臂是慢慢垂下而不是在 4 ms 内突然失去支撑。
