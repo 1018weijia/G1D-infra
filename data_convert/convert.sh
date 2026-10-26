@@ -65,6 +65,8 @@ Options:
   --output-dir PATH             LeRobot dataset output dir
   --constants PATH              robot constants.py (default: this directory)
   --robot-type NAME             robot_type key in constants.py
+                                (default NoUseWaist; relabelled to UseWaist
+                                when the JSON contains waist fields)
   --bad IDS                     extra bad episode numbers, e.g. 7,15 or "7 15"
   --no-auto-bad                 ignore FAILED markers; use --bad only
   --task TEXT                   override language instruction

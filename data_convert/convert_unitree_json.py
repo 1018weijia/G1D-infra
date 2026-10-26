@@ -10,8 +10,15 @@ LeRobot columns that keep the original grouping, for example:
   - observation.state.left_arm_pose.qpos
   - action.right_arm.qpos
   - action.torso.qvel
+  - action.waist.qpos          yaw only, present when collect.py ran with --use-waist
+  - action.waist_pitch.qpos    bend, its own column, not appended to waist.qpos
 Empty lists (typical unused qvel/torque) are skipped because they have no
 values; every non-empty numeric leaf is kept. RGB images are encoded as MP4.
+
+The default robot_type is relabelled to ..._UseWaist when the JSON carries
+waist fields; pass --robot-type to keep another label. Episodes in one input
+folder must agree on whether they carry waist fields: see
+check_waist_consistency.
 
 Bad source episodes (folder numbers such as episode_0007 -> 7) are kept in the
 dataset and tagged on every frame as:
@@ -67,6 +74,12 @@ CAMERA_TO_IMAGE_KEY = {
     "color_2": "cam_left_wrist",
     "color_3": "cam_right_wrist",
 }
+
+# collect.py records these only with --use-waist. Yaw is waist.qpos (length 1).
+# Bend is waist_pitch.qpos (length 1). They stay separate columns.
+NO_WAIST_ROBOT_TYPE = "Unitree_G1_MoveibleLift_Dex1_NoUseWaist"
+WAIST_ROBOT_TYPE = "Unitree_G1_MoveibleLift_Dex1_UseWaist"
+WAIST_VECTOR_SUFFIXES = (".waist.qpos", ".waist_pitch.qpos")
 
 # Cameras were bound to the opposite arms before this date, so those episodes
 # stored the right wrist in color_2. Both mappings yield the same feature
@@ -478,6 +491,88 @@ def scan_schema(
     return vector_dims, cameras, fps or fps_fallback, sorted(empty_always or [])
 
 
+def schema_has_waist(vector_dims: dict[str, int]) -> bool:
+    return any(path.endswith(WAIST_VECTOR_SUFFIXES) for path in vector_dims)
+
+
+WAIST_GROUPS = ("waist", "waist_pitch")
+# collect.py writes these group names and nothing else does, so a byte marker is
+# enough to skip a full parse of the episodes that plainly have no waist.
+_WAIST_MARKERS = (b'"waist"', b'"waist_pitch"')
+_WAIST_MARKER_BYTES = 512 * 1024
+
+
+def episode_waist_fields(episode_dir: Path) -> tuple[bool, bool]:
+    """Which waist groups this episode records: (yaw, bend).
+
+    One frame is enough: collect.py writes both groups on every frame.
+    """
+    try:
+        with Path(episode_dir, "data.json").open("rb") as handle:
+            head = handle.read(_WAIST_MARKER_BYTES)
+        if not any(marker in head for marker in _WAIST_MARKERS):
+            return (False, False)
+        samples = load_json(Path(episode_dir, "data.json")).get("data") or []
+    except (OSError, ValueError):
+        return (False, False)
+    if not samples:
+        return (False, False)
+    return tuple(
+        any(
+            as_float_vector((samples[0].get(key) or {}).get(group, {}).get("qpos"))
+            is not None
+            for key, _prefix in VECTOR_GROUPS
+        )
+        for group in WAIST_GROUPS
+    )
+
+
+def check_waist_consistency(episode_dirs: list[Path], vector_dims: dict[str, int]) -> None:
+    """Refuse a task that mixes episodes with and without waist fields.
+
+    LeRobot needs one fixed feature set, and padding the missing columns with 0
+    is wrong: those episodes held the bend wherever the operator left it, so the
+    stored action would claim a motion that never happened. A schema that missed
+    a recorded column is refused for the same reason; pad_vector would zero it.
+    """
+    fields = {Path(d).name: episode_waist_fields(d) for d in episode_dirs}
+    problems = []
+    for index, group_name in enumerate(WAIST_GROUPS):
+        with_group = sorted(name for name, flags in fields.items() if flags[index])
+        without_group = sorted(name for name, flags in fields.items() if not flags[index])
+        if with_group and without_group:
+            problems.append(
+                f"{group_name}.qpos is in {len(with_group)} episode(s) "
+                f"(e.g. {', '.join(with_group[:3])}) but not in "
+                f"{len(without_group)} (e.g. {', '.join(without_group[:3])})"
+            )
+    if problems:
+        raise ValueError(
+            "Input mixes episodes with and without waist fields, and one dataset "
+            "needs one feature set. Missing columns are not padded with 0: "
+            + "; ".join(problems)
+            + ". Convert them into separate datasets, or re-record with the same "
+            "--use-waist setting."
+        )
+
+    for prefix in (STATE_PREFIX, ACTION_PREFIX):
+        for index, group in enumerate(WAIST_GROUPS):
+            column = f"{prefix}.{group}.qpos"
+            if column not in vector_dims and any(flags[index] for flags in fields.values()):
+                raise ValueError(
+                    f"This input records {group}.qpos, but the schema scan "
+                    f"missed {column}. That column would be filled with 0. "
+                    "Run again with --schema-episodes 0."
+                )
+
+
+def robot_type_for_schema(robot_type: str, vector_dims: dict[str, int]) -> str:
+    """Relabel the default no-waist type when the JSON actually has a waist."""
+    if robot_type == NO_WAIST_ROBOT_TYPE and schema_has_waist(vector_dims):
+        return WAIST_ROBOT_TYPE
+    return robot_type
+
+
 def extract_frame_vectors(sample: dict, vector_dims: dict[str, int]) -> dict[str, np.ndarray]:
     leaves: dict[str, np.ndarray] = {}
     for json_key, prefix in VECTOR_GROUPS:
@@ -542,6 +637,19 @@ def convert(args: argparse.Namespace) -> None:
         args.fps,
         max_schema_episodes=args.schema_episodes,
     )
+    # The schema scan only reads the first episode by default, so a waist column
+    # that exists elsewhere would be silently dropped. Check the whole folder
+    # first: consistent input is the only shape this conversion accepts.
+    check_waist_consistency(episode_dirs, vector_dims)
+    chosen_robot = robot_type_for_schema(args.robot_type, vector_dims)
+    if chosen_robot != args.robot_type:
+        print(
+            "Note: JSON includes waist yaw and/or waist pitch "
+            "(action.waist.qpos, action.waist_pitch.qpos). "
+            f"robot_type {args.robot_type} -> {chosen_robot}. "
+            "Pass --robot-type to keep a different label."
+        )
+        args.robot_type = chosen_robot
     features = build_features(vector_dims, cameras, args.mode)
 
     if output_dir.exists():
@@ -720,7 +828,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--robot-type",
         type=str,
         default="Unitree_G1_MoveibleLift_Dex1_NoUseWaist",
-        help="Stored in dataset metadata; vector fields are taken from JSON.",
+        help=(
+            "Stored in dataset metadata. The default is relabelled to "
+            "Unitree_G1_MoveibleLift_Dex1_UseWaist when the JSON has waist fields. "
+            "Vector fields are taken from JSON either way."
+        ),
     )
     parser.add_argument(
         "--bad-episodes",
@@ -810,7 +922,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--schema-episodes",
         type=int,
         default=1,
-        help="How many episodes to scan for vector/camera schema. 0 means all.",
+        help=(
+            "How many episodes to scan for vector/camera schema. 0 means all. "
+            "Waist columns are checked across every episode regardless."
+        ),
     )
     parser.add_argument("--constants", type=Path, default=DEFAULT_CONSTANTS_PATH,
                         help="Path to constants.py (or a unitree_lerobot checkout).")
