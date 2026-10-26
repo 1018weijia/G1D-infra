@@ -1,9 +1,9 @@
 """Read a recorded episode back as a joint-space trajectory. No hardware here.
 
-collect.py stores, per frame, the commanded arm joints and gripper openings.
-Replaying those numbers reproduces the take open loop. This module does the
-loading, range checking, and the ramp that carries the robot from wherever it
-is standing to the first frame; teleop.replay owns everything that talks to DDS.
+collect.py stores the commanded arm joints and gripper openings per frame, plus
+waist yaw (waist.qpos) and waist pitch (waist_pitch.qpos) when it ran with
+--use-waist. Both waist fields are optional: episodes without them replay arms
+only. This module loads and range-checks the numbers; teleop.replay owns DDS.
 """
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ GRIPPER_DIM = 2
 # trajectory cannot command anything a policy would be refused for.
 MAX_ABS_ARM_Q = 3.5
 GRIPPER_LIMITS = (-0.1, 5.5)
+# collect.py clips yaw to this range; pitch is the bend controller's travel
+# (0..~2.36 rad) plus a little slack so a command on the stop is not rejected.
+MAX_ABS_WAIST_YAW = 2.5
+WAIST_PITCH_LIMITS = (-0.05, 2.45)
 # The controller clips to 30 rad/s, which at 30 Hz still allows ~1 rad between
 # two commands. Recorded teleoperation stays far below this, so anything larger
 # means a damaged file rather than a fast motion.
@@ -42,6 +46,8 @@ class Trajectory:
     path: str
     frame_indices: np.ndarray
     success: Optional[bool]
+    waist_yaw: Optional[np.ndarray] = None      # (T,) radians, or None if not recorded
+    waist_pitch: Optional[np.ndarray] = None    # (T,) radians, or None if not recorded
 
     def __len__(self):
         return int(self.arm_q.shape[0])
@@ -49,6 +55,10 @@ class Trajectory:
     @property
     def duration(self):
         return len(self) / self.fps if self.fps > 0 else float("nan")
+
+    @property
+    def has_waist(self):
+        return self.waist_yaw is not None or self.waist_pitch is not None
 
 
 def _leaf(frame, block, group, key, index):
@@ -66,6 +76,58 @@ def _leaf(frame, block, group, key, index):
     if vector.size == 0:
         raise TrajectoryError(f"frame {index}: '{block}.{group}.{key}' is empty")
     return vector
+
+
+def _optional_scalar(frame, block, group, index):
+    """Return one joint from an optional group, or None when the group is absent.
+
+    Yaw lives in waist.qpos, bend in waist_pitch.qpos; each must be length 1.
+    """
+    try:
+        node = frame[block]
+    except (KeyError, TypeError):
+        raise TrajectoryError(
+            f"frame {index} has no '{block}'. "
+            f"Is this a G1-D episode recorded by collect.py?"
+        ) from None
+    if not isinstance(node, dict) or group not in node:
+        return None
+    group_node = node[group]
+    if not isinstance(group_node, dict) or "qpos" not in group_node:
+        return None
+    value = group_node.get("qpos")
+    if value is None:
+        return None
+    vector = np.atleast_1d(np.asarray(value, dtype=float)).reshape(-1)
+    if vector.size == 0:
+        return None
+    if vector.size != 1:
+        raise TrajectoryError(
+            f"frame {index}: '{block}.{group}.qpos' must be length 1, got {vector.size}. "
+            f"Yaw stays in waist.qpos and bend stays in waist_pitch.qpos."
+        )
+    return float(vector[0])
+
+
+def _load_optional_series(frames, indices, source, group):
+    """Load one optional scalar series. All selected frames must agree."""
+    present = None
+    values = np.empty(len(indices), dtype=float)
+    for row, index in enumerate(indices):
+        value = _optional_scalar(frames[index], source, group, index)
+        if present is None:
+            present = value is not None
+        elif present != (value is not None):
+            state = "missing" if value is None else "present"
+            raise TrajectoryError(
+                f"frame {index}: '{source}.{group}.qpos' is {state}, "
+                f"but other frames in this range disagree"
+            )
+        if present:
+            values[row] = value
+    if not present:
+        return None
+    return values
 
 
 def load_trajectory(data_json, source="actions", start=0, end=None, stride=1):
@@ -121,6 +183,9 @@ def load_trajectory(data_json, source="actions", start=0, end=None, stride=1):
         grippers[row, 0] = _leaf(frame, source, "left_ee", "qpos", index)[0]
         grippers[row, 1] = _leaf(frame, source, "right_ee", "qpos", index)[0]
 
+    waist_yaw = _load_optional_series(frames, indices, source, "waist")
+    waist_pitch = _load_optional_series(frames, indices, source, "waist_pitch")
+
     fps = float(payload.get("info", {}).get("image", {}).get("fps") or 30.0)
     if not np.isfinite(fps) or fps <= 0:
         fps = 30.0
@@ -135,15 +200,43 @@ def load_trajectory(data_json, source="actions", start=0, end=None, stride=1):
         path=path,
         frame_indices=np.asarray(indices, dtype=int),
         success=payload.get("success"),
+        waist_yaw=waist_yaw,
+        waist_pitch=waist_pitch,
     )
 
 
+def _series_problems(values, frame_indices, label, low, high, max_joint_step):
+    """Range and step checks for one scalar joint series. Empty means safe."""
+    problems = []
+    if float(values.min()) < low or float(values.max()) > high:
+        problems.append(
+            f"{label} spans [{values.min():.3f}, {values.max():.3f}] rad, "
+            f"outside [{low}, {high}]"
+        )
+    if values.shape[0] > 1:
+        steps = np.abs(np.diff(values))
+        worst_step = float(steps.max())
+        if worst_step > max_joint_step:
+            row = int(np.argmax(steps))
+            problems.append(
+                f"{label} jumps {worst_step:.3f} rad between frames "
+                f"{frame_indices[row]} and {frame_indices[row + 1]}, "
+                f"over the {max_joint_step} rad limit"
+            )
+    return problems
+
+
 def check_trajectory(traj, max_abs_arm_q=MAX_ABS_ARM_Q, gripper_limits=GRIPPER_LIMITS,
-                     max_joint_step=MAX_JOINT_STEP):
+                     max_joint_step=MAX_JOINT_STEP, max_abs_waist_yaw=MAX_ABS_WAIST_YAW,
+                     waist_pitch_limits=WAIST_PITCH_LIMITS):
     """Return a list of reasons this trajectory is unsafe to send. Empty is good."""
     problems = []
-
-    if not np.all(np.isfinite(traj.arm_q)) or not np.all(np.isfinite(traj.grippers)):
+    series = [traj.arm_q, traj.grippers]
+    if traj.waist_yaw is not None:
+        series.append(traj.waist_yaw)
+    if traj.waist_pitch is not None:
+        series.append(traj.waist_pitch)
+    if any(not np.all(np.isfinite(item)) for item in series):
         problems.append("trajectory contains NaN or inf")
         return problems
 
@@ -173,6 +266,18 @@ def check_trajectory(traj, max_abs_arm_q=MAX_ABS_ARM_Q, gripper_limits=GRIPPER_L
                 f"over the {max_joint_step} rad limit"
             )
 
+    if traj.waist_yaw is not None:
+        problems.extend(_series_problems(
+            traj.waist_yaw, traj.frame_indices, "waist yaw",
+            -max_abs_waist_yaw, max_abs_waist_yaw, max_joint_step,
+        ))
+    if traj.waist_pitch is not None:
+        low, high = waist_pitch_limits
+        problems.extend(_series_problems(
+            traj.waist_pitch, traj.frame_indices, "waist pitch",
+            low, high, max_joint_step,
+        ))
+
     return problems
 
 
@@ -191,7 +296,7 @@ def approach_profile(current_q, current_grippers, target_q, target_grippers, sec
     if seconds <= 0 or fps <= 0:
         return [(target_q.copy(), target_grippers.copy())]
 
-    steps = max(1, int(round(seconds * fps)))
+    steps = ramp_steps(seconds, fps)
     out = []
     for i in range(1, steps + 1):
         gain = smoothstep(i / steps)
@@ -202,7 +307,35 @@ def approach_profile(current_q, current_grippers, target_q, target_grippers, sec
     return out
 
 
-def summarize(traj, current_q=None):
+def ramp_steps(seconds, fps):
+    """How many samples a smoothstep ramp emits. Matches approach_profile."""
+    if seconds <= 0 or fps <= 0:
+        return 1
+    return max(1, int(round(float(seconds) * float(fps))))
+
+
+def ramp_value(current, target, seconds, fps):
+    """Smoothstep from one scalar to another, excluding the start sample."""
+    current = float(current)
+    target = float(target)
+    if not np.isfinite(current) or not np.isfinite(target):
+        raise TrajectoryError("ramp endpoints must be finite")
+    steps = ramp_steps(seconds, fps)
+    if steps == 1 and (seconds <= 0 or fps <= 0):
+        return [target]
+    return [
+        current + (target - current) * smoothstep(i / steps)
+        for i in range(1, steps + 1)
+    ]
+
+
+def _joint_line(label, values):
+    step = float(np.abs(np.diff(values)).max()) if values.shape[0] > 1 else 0.0
+    return (f"{label}: [{float(values.min()):+.3f}, {float(values.max()):+.3f}] rad, "
+            f"max step {step:.3f}")
+
+
+def summarize(traj, current_q=None, current_yaw=None, current_pitch=None):
     """Human-readable report shown before anything moves."""
     lines = [
         f"episode : {traj.path}",
@@ -222,9 +355,26 @@ def summarize(traj, current_q=None):
                  f"max step {np.abs(np.diff(right, axis=0)).max() if len(traj) > 1 else 0.0:.3f}")
     lines.append(f"grippers : left [{traj.grippers[:, 0].min():.2f}, {traj.grippers[:, 0].max():.2f}], "
                  f"right [{traj.grippers[:, 1].min():.2f}, {traj.grippers[:, 1].max():.2f}]")
+    if not traj.has_waist:
+        lines.append("waist    : not in this episode")
+    else:
+        if traj.waist_yaw is None:
+            lines.append("waist yaw  : not in this episode")
+        else:
+            lines.append(_joint_line("waist yaw ", traj.waist_yaw))
+        if traj.waist_pitch is None:
+            lines.append("waist pitch: not in this episode")
+        else:
+            lines.append(_joint_line("waist pitch", traj.waist_pitch))
 
     if current_q is not None:
         gap = np.abs(np.asarray(current_q, dtype=float).reshape(-1) - traj.arm_q[0])
         lines.append(f"approach : largest joint gap to frame {traj.frame_indices[0]} "
                      f"is {gap.max():.3f} rad (joint {int(np.argmax(gap))})")
+    if current_yaw is not None and traj.waist_yaw is not None:
+        gap = abs(float(current_yaw) - float(traj.waist_yaw[0]))
+        lines.append(f"yaw gap  : {gap:.3f} rad to frame {traj.frame_indices[0]}")
+    if current_pitch is not None and traj.waist_pitch is not None:
+        gap = abs(float(current_pitch) - float(traj.waist_pitch[0]))
+        lines.append(f"pitch gap: {gap:.3f} rad to frame {traj.frame_indices[0]}")
     return "\n".join(lines)

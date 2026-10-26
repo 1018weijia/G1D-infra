@@ -8,7 +8,7 @@ import numpy as np
 
 from teleop.utils.trajectory_replay import (
     ARM_DIM, TrajectoryError, approach_profile, check_trajectory, load_trajectory,
-    smoothstep, summarize,
+    ramp_value, smoothstep, summarize,
 )
 
 
@@ -22,7 +22,8 @@ def block(left_arm, right_arm, left_ee, right_ee):
 
 
 def write_episode(root, frames=10, fps=30.0, success=None, scale=0.01, drop=None,
-                  gripper_scalar=False):
+                  gripper_scalar=False, with_waist=False, drop_waist_at=None,
+                  waist_width=1):
     """Write an episode shaped like collect.py's output."""
     data = []
     for i in range(frames):
@@ -34,6 +35,13 @@ def write_episode(root, frames=10, fps=30.0, success=None, scale=0.01, drop=None
             actions["left_ee"]["qpos"] = 0.5 + i * scale
         if drop is not None and i == 0:
             actions.pop(drop, None)
+        if with_waist and not (drop_waist_at is not None and i == drop_waist_at):
+            yaw = [i * scale] * waist_width
+            pitch = [0.1 + i * scale]
+            states["waist"] = {"qpos": yaw}
+            actions["waist"] = {"qpos": [v + 0.001 for v in yaw]}
+            states["waist_pitch"] = {"qpos": pitch}
+            actions["waist_pitch"] = {"qpos": [v + 0.001 for v in pitch]}
         data.append({"idx": i, "colors": {}, "states": states, "actions": actions})
 
     payload = {"info": {"image": {"fps": fps}}, "text": {"goal": "t"}, "data": data}
@@ -126,6 +134,36 @@ class LoadTests(unittest.TestCase):
         with self.assertRaises(TrajectoryError):
             load_trajectory(path, source="tactiles")
 
+    def test_episode_without_waist_stays_arms_only(self):
+        traj = load_trajectory(write_episode(self.tmp.name))
+        self.assertIsNone(traj.waist_yaw)
+        self.assertIsNone(traj.waist_pitch)
+        self.assertIn("not in this episode", summarize(traj))
+
+    def test_waist_yaw_and_pitch_are_separate_series(self):
+        traj = load_trajectory(write_episode(self.tmp.name, frames=4, with_waist=True))
+        self.assertEqual(traj.waist_yaw.shape, (4,))
+        self.assertEqual(traj.waist_pitch.shape, (4,))
+        # actions are the command plus the 0.001 offset used by the fixture.
+        np.testing.assert_allclose(traj.waist_yaw, [0.001, 0.011, 0.021, 0.031])
+        np.testing.assert_allclose(traj.waist_pitch, [0.101, 0.111, 0.121, 0.131])
+        text = summarize(traj)
+        self.assertIn("waist yaw", text)
+        self.assertIn("waist pitch", text)
+        self.assertNotIn("not in this episode", text)
+
+    def test_waist_group_must_be_present_on_every_frame(self):
+        path = write_episode(self.tmp.name, frames=4, with_waist=True, drop_waist_at=2)
+        with self.assertRaises(TrajectoryError) as ctx:
+            load_trajectory(path)
+        self.assertIn("frame 2", str(ctx.exception))
+
+    def test_waist_qpos_stays_length_one(self):
+        path = write_episode(self.tmp.name, with_waist=True, waist_width=2)
+        with self.assertRaises(TrajectoryError) as ctx:
+            load_trajectory(path)
+        self.assertIn("length 1", str(ctx.exception))
+
 
 class CheckTests(unittest.TestCase):
     def setUp(self):
@@ -159,6 +197,18 @@ class CheckTests(unittest.TestCase):
     def test_single_frame_has_no_step_to_check(self):
         traj = load_trajectory(write_episode(self.tmp.name, frames=1))
         self.assertEqual(check_trajectory(traj), [])
+
+    def test_waist_limits_and_jumps(self):
+        traj = load_trajectory(write_episode(self.tmp.name, frames=6, scale=0.01, with_waist=True))
+        self.assertEqual(check_trajectory(traj), [])
+        traj.waist_yaw[1] = 3.0
+        self.assertTrue(any("waist yaw" in p and "2.5" in p for p in check_trajectory(traj)))
+        traj.waist_yaw[1] = 0.011
+        traj.waist_pitch[2] = 3.0
+        self.assertTrue(any("waist pitch" in p for p in check_trajectory(traj)))
+        traj.waist_pitch[2] = 0.121
+        traj.waist_pitch[4] += 1.0
+        self.assertTrue(any("waist pitch" in p and "jumps" in p for p in check_trajectory(traj)))
 
 
 class ApproachTests(unittest.TestCase):
@@ -200,6 +250,13 @@ class ApproachTests(unittest.TestCase):
         self.assertEqual(smoothstep(1.0), 1.0)
         self.assertEqual(smoothstep(-5.0), 0.0)
         self.assertEqual(smoothstep(5.0), 1.0)
+
+    def test_scalar_ramp_matches_the_arm_approach_length(self):
+        arms = approach_profile(np.zeros(ARM_DIM), [0.0, 0.0], np.ones(ARM_DIM), [1.0, 1.0], 2.0, 30.0)
+        yaw = ramp_value(0.0, 0.4, 2.0, 30.0)
+        self.assertEqual(len(yaw), len(arms))
+        self.assertEqual(yaw[0], smoothstep(1 / 60) * 0.4)
+        self.assertAlmostEqual(yaw[-1], 0.4)
 
 
 class SummaryTests(unittest.TestCase):
