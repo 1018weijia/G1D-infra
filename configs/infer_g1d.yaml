@@ -39,6 +39,20 @@ dataset:
   params:
     wan_path: "/path/to/pretrained_models"
 
+# Optional long-span history. Omit this block entirely to keep the request
+# byte-identical to the single-frame path: no buffer, no disk, no extra keys.
+# Sample on the client from policy start, then send a strided subset per request.
+# history:
+#   enabled: false          # master switch for sampling and disk use
+#   sample_hz: 5.0          # capture rate
+#   send: false             # attach history_frames to each ZMQ request
+#   interval_seconds: 0.5   # spacing between selected frames
+#   count: 16               # maximum frames to send
+#   include_first: true     # always include the run's first frame
+#   include_rollback: false # keep frames captured during rollback
+#   jpeg_quality: 90
+#   max_samples: 1800       # ring size; 1800 at 5 Hz is 6 min of history
+
 model:
   wan:
     checkpoint_path: "/path/to/wan"

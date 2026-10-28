@@ -70,6 +70,8 @@ SSH_HOST=... SSH_PORT=... SSH_USER=... SSH_KEY=... REMOTE_POLICY_HOST=... REMOTE
 
 ZMQ 图像由 [`configs/infer_g1d.yaml`](configs/infer_g1d.yaml) 的 `dataset.image_layout` 决定，状态和动作格式不变。`stitched`（默认）把头顶和左右腕拼成一张 `first_frame`。`separate` 不拼接，`images` 为 `left_eye`（双目头图左半幅）、`left_wrist`、`right_wrist`，保持相机原分辨率。服务端按 `image_layout` 取字段。WebSocket 只支持 `stitched`。
 
+同一个配置文件里的 `history` 块可选，默认整块不写就等于关闭，请求与不带历史时逐字节相同。需要长时序上下文时把它打开：`Policy` 启动后客户端按 `sample_hz`（默认 5 Hz）把拼接帧和 16 维原始状态写到 `/tmp/g1d_frame_history/<pid>_<时间戳>/`，退出时整目录删除。缓冲是环形，`max_samples`（默认 1800，5 Hz 下约 6 分钟）满了就丢最旧的帧但保留第一帧。每次推理按 `interval_seconds` 间隔挑最多 `count` 帧，默认跳过回退期间的帧，并在 `include_first: true` 时把第一帧放最后一起发。`send: true` 才把历史塞进 ZMQ 请求的 `history` 键（`frames` 为 JPEG 字节，`t_rel` 与 `state` 对齐），所以历史和 `--protocol zmq` 绑定，配成 WebSocket 会在启动时直接报错而不是悄悄丢帧。
+
 可选 `--record` 把部署过程存成 episode（默认关）。录制时状态转换会追加写 `intervention.jsonl`（`rollback_start` / `align_ok` / `teleop_enter` / `teleop_hold` / `policy_resume`）；逐帧 `actions.phase` 也会标 `TELEOP_HOLD`。失败用键盘 `F` 或左柄 `X` 标记，与数采语义一致。
 
 ## 操作闭环

@@ -35,9 +35,15 @@ from teleop.utils.arm_owner_lock import ArmOwnerLockError, acquire_arm_owner_loc
 from teleop.utils.dex1_arm_bundle import create_dex1_arm_controller
 from teleop.utils.ego_projection import EgoPixelOverlay
 from teleop.utils.episode_writer import EpisodeWriter
+from teleop.utils.frame_history import FrameHistory
 from teleop.utils.handoff_utils import rollback_endpoint_to_xr_targets
 from teleop.utils.intervention_log import InterventionLogger
-from teleop.utils.policy_client import EefActionChunk, PolicyAdapter, PolicyRemoteClient
+from teleop.utils.policy_client import (
+    EefActionChunk,
+    PolicyAdapter,
+    PolicyRemoteClient,
+    check_history_protocol,
+)
 from teleop.utils.policy_handoff import (
     A_GAP_S,
     A_HANDOFF_DEBOUNCE_S,
@@ -198,11 +204,14 @@ def _read_grippers(arm_ctrl):
 
 
 def _start_policy_from_current_pose(
-        adapter, img_client, arm_ctrl, arm_ik, inference_lock, inference_state, start_inference):
+        adapter, img_client, arm_ctrl, arm_ik, inference_lock, inference_state, start_inference,
+        frame_history=None):
     """Capture the current robot pose and request the next policy chunk."""
     resume_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
     resume_left_grip, resume_right_grip = _read_grippers(arm_ctrl)
-    resume_request = _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik)
+    resume_request = _prepare_policy_request(
+        adapter, img_client, arm_ctrl, arm_ik, frame_history=frame_history,
+    )
     with inference_lock:
         inference_state["result"] = None
         inference_state["error"] = None
@@ -232,11 +241,12 @@ def _write_xr_grippers(left_gripper_value, right_gripper_value, tele_data, input
         _write_controller_grippers(left_gripper_value, right_gripper_value, tele_data)
 
 
-def _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik):
+def _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik, frame_history=None):
     """Capture one observation in the main loop without contacting the cloud.
 
     The eef policy takes the current hand poses as its anchor, so send the same
-    waist-frame poses the arm IK solves against.
+    waist-frame poses the arm IK solves against. This is the only place where a
+    request grows: history frames are attached here when the config asks for them.
     """
     current_arm_q = arm_ctrl.get_current_dual_arm_q()[:14].copy()
     left_grip, right_grip = _read_grippers(arm_ctrl)
@@ -252,7 +262,65 @@ def _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik):
     left_pose, right_pose = arm_ik.solve_fk_matrix(np.asarray(current_arm_q, dtype=float))
     observation.eef_left = np.asarray(left_pose, dtype=np.float64)
     observation.eef_right = np.asarray(right_pose, dtype=np.float64)
+    observation = _attach_history_frames(observation, adapter, frame_history)
     return observation, current_arm_q
+
+
+def _attach_history_frames(observation, adapter, frame_history):
+    """Select the configured subset of stored samples for this request."""
+    if frame_history is None or not frame_history.enabled:
+        return observation
+    history_config = adapter.history_config
+    if not history_config.send:
+        return observation
+    samples = frame_history.select(
+        history_config.interval_seconds,
+        history_config.count,
+        include_first=history_config.include_first,
+        include_rollback=history_config.include_rollback,
+    )
+    observation.history_frames = [sample.as_request_tuple() for sample in samples] or None
+    return observation
+
+
+_HISTORY_PHASES = (POLICY_LIVE, POLICY_ROLLBACK)
+
+
+def _sync_history_phase(frame_history, run_phase):
+    """Sample only while a rollout is live, without touching every phase assignment.
+
+    Rollback stays sampled on purpose so those frames can be stored with a
+    rollback marker and then filtered out of the forward trajectory.
+    """
+    if run_phase in _HISTORY_PHASES:
+        if not frame_history.started:
+            frame_history.start()
+    elif frame_history.started:
+        frame_history.stop()
+
+
+def _capture_history_sample(frame_history, adapter, head_img, left_wrist_img,
+                            right_wrist_img, arm_ctrl, run_phase):
+    """Store one throttled sample: the stitched frame the model sees, plus raw state."""
+    # Check the throttle before stitching: the stitch is cheap but this runs at
+    # 30 Hz while only sample_hz samples per second are wanted.
+    now = time.monotonic()
+    if not frame_history.due(now):
+        return
+    head_bgr = getattr(head_img, "bgr", None)
+    left_bgr = getattr(left_wrist_img, "bgr", None)
+    right_bgr = getattr(right_wrist_img, "bgr", None)
+    if head_bgr is None or left_bgr is None or right_bgr is None:
+        return
+    frame = adapter.build_history_frame(head_bgr, left_bgr, right_bgr)
+    if frame is None:
+        return
+    current_arm_q = arm_ctrl.get_current_dual_arm_q()[:14]
+    left_grip, right_grip = _read_grippers(arm_ctrl)
+    state = adapter.build_raw_state(current_arm_q, left_grip, right_grip)
+    frame_history.capture(
+        frame, state, now=now, rolling_back=run_phase == POLICY_ROLLBACK,
+    )
 
 
 def _predict_policy_queue(adapter, remote, request, instruction):
@@ -456,6 +524,9 @@ if __name__ == "__main__":
     intervention_log = InterventionLogger()
     inference_thread = None
     inference_stop = False
+    # Disabled by default; replaced below when the config enables history. The
+    # disabled instance allocates nothing and leaves requests untouched.
+    frame_history = FrameHistory(enabled=False)
     try:
         ChannelFactoryInitialize(0, networkInterface=args.network_interface)
 
@@ -517,6 +588,23 @@ if __name__ == "__main__":
             pad_joint_values=pad_joint_values,
         )
         logger_mp.info("Policy image layout: %s", adapter.image_layout)
+        check_history_protocol(adapter.history_config, args.protocol)
+        if adapter.history_config.enabled:
+            frame_history = FrameHistory(
+                sample_hz=adapter.history_config.sample_hz,
+                enabled=True,
+                jpeg_quality=adapter.history_config.jpeg_quality,
+                max_samples=adapter.history_config.max_samples,
+            )
+            logger_mp.info(
+                "Frame history enabled: sample %.2fHz, send=%s, count=%d, "
+                "interval=%.2fs, buffer=%d",
+                adapter.history_config.sample_hz,
+                adapter.history_config.send,
+                adapter.history_config.count,
+                adapter.history_config.interval_seconds,
+                adapter.history_config.max_samples,
+            )
         # Connect lazily in the inference worker so startup and Q remain responsive.
         remote = PolicyRemoteClient(
             args.server_host,
@@ -630,6 +718,7 @@ if __name__ == "__main__":
                 _start_policy_from_current_pose(
                     adapter, img_client, arm_ctrl, arm_ik,
                     inference_lock, inference_state, start_inference,
+                    frame_history=frame_history,
                 )
             )
             action_queue = []
@@ -681,9 +770,19 @@ if __name__ == "__main__":
 
         while not STOP:
             loop_start = time.time()
-            head_img = img_client.get_head_frame() if (use_zmq_display or args.record) else None
-            left_wrist_img = img_client.get_left_wrist_frame() if args.record else None
-            right_wrist_img = img_client.get_right_wrist_frame() if args.record else None
+            _sync_history_phase(frame_history, RUN_PHASE)
+            want_head = use_zmq_display or args.record or frame_history.started
+            # Wrists were only read for recording before; reading them for the
+            # display path too would add unrelated subscription work.
+            want_wrists = args.record or frame_history.started
+            head_img = img_client.get_head_frame() if want_head else None
+            left_wrist_img = img_client.get_left_wrist_frame() if want_wrists else None
+            right_wrist_img = img_client.get_right_wrist_frame() if want_wrists else None
+            if frame_history.started:
+                _capture_history_sample(
+                    frame_history, adapter, head_img, left_wrist_img, right_wrist_img,
+                    arm_ctrl, RUN_PHASE,
+                )
 
             tele_data = tv_wrapper.get_tele_data()
             if gamepad_a.update(getattr(tele_data, "right_ctrl_aButton", False)):
@@ -894,7 +993,10 @@ if __name__ == "__main__":
                         len(action_queue) <= args.policy_prefetch_steps and
                         not worker_busy):
                     try:
-                        request = _prepare_policy_request(adapter, img_client, arm_ctrl, arm_ik)
+                        request = _prepare_policy_request(
+                            adapter, img_client, arm_ctrl, arm_ik,
+                            frame_history=frame_history,
+                        )
                         if not start_inference(request):
                             logger_mp.debug("Policy inference worker is still busy.")
                     except Exception as request_error:
@@ -1175,6 +1277,10 @@ if __name__ == "__main__":
                 logger_mp.error("Failed to close recorder: %s", record_error)
         if img_client is not None:
             img_client.close()
+        try:
+            frame_history.discard()
+        except Exception as history_error:
+            logger_mp.error("Failed to discard frame history: %s", history_error)
         if arm_lock is not None:
             arm_lock.release()
         logger_mp.info("Policy rollout handoff exited.")

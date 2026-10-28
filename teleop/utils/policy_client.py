@@ -17,6 +17,8 @@ import cv2
 import numpy as np
 import yaml
 
+from teleop.utils.frame_history import HistoryConfig, parse_history_config
+
 logger = logging.getLogger(__name__)
 
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
@@ -33,6 +35,8 @@ class PolicyObservation:
     images: Optional[dict] = None
     eef_left: Optional[np.ndarray] = None
     eef_right: Optional[np.ndarray] = None
+    # Optional list of (n, t_rel, jpeg_bytes, state16) samples from FrameHistory.
+    history_frames: Optional[list] = None
 
 
 @dataclass
@@ -59,12 +63,43 @@ def build_zmq_request(observation: PolicyObservation, instruction: str) -> dict:
         if observation.first_frame is None:
             raise ValueError("stitched observation is missing first_frame")
         request["first_frame"] = np.asarray(observation.first_frame)
-        return _attach_eef(request, observation)
+        return _attach_history(_attach_eef(request, observation), observation)
     images = observation.images or {}
     if not images:
         raise ValueError("separate observation is missing images")
     request["images"] = {name: np.asarray(image) for name, image in images.items()}
-    return _attach_eef(request, observation)
+    return _attach_history(_attach_eef(request, observation), observation)
+
+
+def _attach_history(request: dict, observation: PolicyObservation) -> dict:
+    """Add historical frames when present; the key is absent in the default path."""
+    frames = observation.history_frames
+    if not frames:
+        return request
+    request["history"] = {
+        "frames": [np.frombuffer(jpeg, np.uint8) for _, _, jpeg, _ in frames],
+        "t_rel": np.asarray([float(t_rel) for _, t_rel, _, _ in frames], np.float32),
+        "state": np.asarray([state for _, _, _, state in frames], np.float32),
+    }
+    return request
+
+
+def check_history_protocol(history_config: HistoryConfig, protocol: str) -> None:
+    """Refuse to send history over a transport that only carries one frame.
+
+    Raising here beats silently dropping frames: an operator who set
+    ``history.send`` expects the policy to receive them.
+    """
+    if not history_config.enabled or not history_config.send:
+        return
+    normalised = str(protocol or "ws").lower()
+    if normalised == "websocket":
+        normalised = "ws"
+    if normalised != "zmq":
+        raise RuntimeError(
+            f"history.send requires the zmq protocol, got {protocol!r}; "
+            "the WebSocket path accepts a single stitched frame only"
+        )
 
 
 def _attach_eef(request: dict, observation: PolicyObservation) -> dict:
@@ -353,6 +388,11 @@ class PolicyRemoteClient:
     def predict(self, observation, instruction):
         if self.protocol == "zmq":
             return self._predict_zmq(observation, instruction)
+        if observation.history_frames:
+            raise RuntimeError(
+                "history frames require the zmq protocol; the WebSocket path "
+                "accepts a single stitched frame only"
+            )
         if observation.image_layout != "stitched":
             raise RuntimeError(
                 "WebSocket inference only accepts image_layout=stitched; "
@@ -428,6 +468,7 @@ class PolicyAdapter:
             raise ValueError(
                 f"image_layout must be one of {_IMAGE_LAYOUTS}, got {self.image_layout!r}"
             )
+        self.history_config = parse_history_config(self.config_dict.get("history"))
         self.action_mode = str(ds_cfg.get("action_mode", "qpos"))
         self.current_instruction = instruction
         self.action_interp_factor = max(1, int(action_interp_factor))
@@ -534,6 +575,33 @@ class PolicyAdapter:
         )
         return canvas.astype(np.float32) / 255.0
 
+    @staticmethod
+    def build_raw_state(current_arm_q, left_grip, right_grip):
+        """16-dim unnormalised state in raw [L7, LG, R7, RG] order."""
+        raw_state = np.zeros(16, dtype=np.float32)
+        raw_state[0:7] = current_arm_q[0:7]
+        raw_state[7:14] = current_arm_q[7:14]
+        raw_state[14] = float(left_grip)
+        raw_state[15] = float(right_grip)
+        return raw_state
+
+    def build_history_frame(self, head_bgr, left_wrist_bgr, right_wrist_bgr):
+        """Stitched frame as JPEG-ready uint8 whose decoded array matches first_frame.
+
+        History frames travel as JPEG, so they are encoded from the BGR view of
+        the same RGB canvas the model sees: decoding the JPEG with cv2 yields an
+        array in first_frame's ordering.
+        """
+        if head_bgr is None or left_wrist_bgr is None or right_wrist_bgr is None:
+            return None
+        head_rgb = cv2.cvtColor(head_bgr, cv2.COLOR_BGR2RGB)
+        left_rgb = cv2.cvtColor(left_wrist_bgr, cv2.COLOR_BGR2RGB)
+        right_rgb = cv2.cvtColor(right_wrist_bgr, cv2.COLOR_BGR2RGB)
+        if self.swap_wrists:
+            left_rgb, right_rgb = right_rgb, left_rgb
+        stitched = (self.build_stitched_image(head_rgb, left_rgb, right_rgb) * 255.0)
+        return cv2.cvtColor(stitched.astype(np.uint8), cv2.COLOR_RGB2BGR)
+
     def build_model_input(self, head_bgr, left_wrist_bgr, right_wrist_bgr,
                           current_arm_q, left_grip, right_grip):
         if head_bgr is None or left_wrist_bgr is None or right_wrist_bgr is None:
@@ -545,11 +613,7 @@ class PolicyAdapter:
             left_rgb, right_rgb = right_rgb, left_rgb
         if self.action_mode != "qpos":
             raise NotImplementedError("policy handoff supports qpos action mode only")
-        raw_state = np.zeros(16, dtype=np.float32)
-        raw_state[0:7] = current_arm_q[0:7]
-        raw_state[7:14] = current_arm_q[7:14]
-        raw_state[14] = float(left_grip)
-        raw_state[15] = float(right_grip)
+        raw_state = self.build_raw_state(current_arm_q, left_grip, right_grip)
         state = self._to_arm_interleaved(raw_state).astype(np.float32)
         if self.image_layout == "stitched":
             stitched = self.build_stitched_image(head_rgb, left_rgb, right_rgb)

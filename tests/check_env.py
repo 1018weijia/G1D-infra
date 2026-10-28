@@ -23,6 +23,7 @@ RUNTIME_MODULES = [
 REPO_MODULES = [
     "teleop.utils.episode_writer",
     "teleop.utils.policy_client",
+    "teleop.utils.frame_history",
     "teleop.utils.policy_handoff",
     "teleop.utils.rollback",
     "teleop.utils.alignment",
