@@ -1,11 +1,16 @@
 """Hardware-free smoke tests for policy rollout handoff helpers."""
+import os
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
 
 from teleop.utils.handoff_utils import limit_joint_step, smoothstep_handoff_gain
-from teleop.utils.policy_client import PolicyAdapter, validate_action_chunk
+from teleop.utils.policy_client import (
+    EefActionChunk,
+    PolicyAdapter,
+    validate_action_chunk,
+)
 from teleop.utils.policy_handoff import (
     A_GAP_S,
     ALIGNING,
@@ -33,6 +38,8 @@ from teleop.utils.policy_handoff import (
 )
 from teleop.utils.rollback import PolicyRollbackBuffer, ease_out_playback
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 class PolicyRolloutHandoffTests(unittest.TestCase):
     def test_qpos_conversion_order(self):
@@ -52,14 +59,62 @@ class PolicyRolloutHandoffTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_action_chunk(np.array([np.nan] + [0.0] * 15).reshape(1, 16))
 
-    def test_gripper_range_is_validated_separately(self):
+    def test_gripper_range_is_clamped_not_rejected(self):
         chunk = np.zeros((2, 16), dtype=float)
         chunk[:, [7, 15]] = 5.2
         validated = validate_action_chunk(chunk)
         self.assertEqual(validated.shape, (2, 16))
+        self.assertTrue(np.allclose(validated[:, [7, 15]], 5.2))
+
+        # Above the travel the command saturates instead of failing the chunk,
+        # so the arm joints of the same prediction still get executed.
         chunk[0, 7] = 5.6
+        chunk[1, 15] = 7.0
+        validated = validate_action_chunk(chunk)
+        self.assertEqual(validated.shape, (2, 16))
+        self.assertAlmostEqual(validated[0, 7], 5.5)
+        self.assertAlmostEqual(validated[1, 15], 5.5)
+        self.assertAlmostEqual(validated[1, 7], 5.2)
+        self.assertEqual(float(np.max(validated[:, [7, 15]])), 5.5)
+        # The caller's array must not be mutated by the clamp.
+        self.assertAlmostEqual(chunk[0, 7], 5.6)
+
+    def test_gripper_lower_bound_is_the_closed_stop(self):
+        # The channel is one-sided: closed is 0. A negative prediction is
+        # clamped to 0 rather than sent to the motor.
+        chunk = np.zeros((2, 16), dtype=float)
+        chunk[:, [7, 15]] = -0.4
+        validated = validate_action_chunk(chunk)
+        self.assertTrue(np.allclose(validated[:, [7, 15]], 0.0))
+
+        chunk[1, 15] = 5.2
+        validated = validate_action_chunk(chunk)
+        self.assertAlmostEqual(validated[0, 7], 0.0)
+        self.assertAlmostEqual(validated[1, 15], 5.2)
+        self.assertGreaterEqual(float(np.min(validated[:, [7, 15]])), 0.0)
+
+    def test_arm_limits_still_reject(self):
+        chunk = np.zeros((2, 16), dtype=float)
+        chunk[1, 3] = 4.0
         with self.assertRaises(ValueError):
             validate_action_chunk(chunk)
+
+    def test_eef_grippers_are_clamped(self):
+        adapter = PolicyAdapter(
+            os.path.join(REPO_ROOT, "configs", "infer_g1d.yaml"),
+            exec_chunk_steps=2,
+        )
+        poses = np.repeat(np.eye(4, dtype=float)[None], 2, axis=0)
+        chunk = EefActionChunk(
+            left_pose=poses,
+            right_pose=poses,
+            grippers=np.array([[5.6, -0.4], [1.0, 5.5]]),
+        )
+        queue = adapter.build_eef_queue(chunk)
+        self.assertEqual(len(queue), 2)
+        self.assertAlmostEqual(queue[0].left_grip, 5.5)
+        self.assertAlmostEqual(queue[0].right_grip, 0.0)
+        self.assertAlmostEqual(queue[1].right_grip, 5.5)
 
     def test_policy_rollback_buffer_reverse(self):
         buffer = PolicyRollbackBuffer(seconds=1.0, frequency=10.0)

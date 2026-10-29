@@ -19,8 +19,10 @@ from teleop.utils.ready_pose import smoothstep
 ARM_DIM = 14
 GRIPPER_DIM = 2
 
-# Matches the checks policy_client applies to a policy chunk, so a replayed
-# trajectory cannot command anything a policy would be refused for.
+# Arm limit matches the one policy_client enforces on a policy chunk. The
+# gripper channel is one-sided (0 closed, 5.4 open); a little negative slack is
+# allowed here because a recorded episode stores measured openings, which can
+# dip a few thousandths below zero, while a policy command is clamped to 0.
 MAX_ABS_ARM_Q = 3.5
 GRIPPER_LIMITS = (-0.1, 5.5)
 # collect.py clips yaw to this range; pitch is the bend controller's travel

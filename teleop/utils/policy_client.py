@@ -9,6 +9,7 @@ import os
 import pickle
 import socket
 import struct
+import time
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse
@@ -23,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 _REORDER_FROM_RAW = [0, 1, 2, 3, 4, 5, 6, 14, 7, 8, 9, 10, 11, 12, 13, 15]
 _IMAGE_LAYOUTS = ("stitched", "separate")
+# Gripper saturation happens at the frame rate the policy runs at, so the
+# warning is throttled rather than emitted per chunk.
+_GRIPPER_CLIP_WARN_INTERVAL_S = 5.0
+_last_gripper_clip_warn = 0.0
+# The Dex1 channel is one-sided: 0 is closed, 5.4 is fully open (ready_pose.py
+# uses the same GRIPPER_OPEN). Recorded action commands stay inside [0, 5.4],
+# so a negative policy output means it predicted past the closed stop.
+GRIPPER_LIMITS = (0.0, 5.5)
 
 
 @dataclass
@@ -111,11 +120,61 @@ def _attach_eef(request: dict, observation: PolicyObservation) -> dict:
     return request
 
 
+def clamp_gripper_commands(values, gripper_limits: tuple = GRIPPER_LIMITS):
+    """Saturate gripper commands to their travel and log the peak, throttled.
+
+    A policy sometimes asks for slightly more than the gripper can open. The
+    jaws stop at the mechanical end stop anyway, so clamping keeps the rest of
+    the chunk (all 14 arm joints) usable; refusing the whole chunk would throw
+    away a good prediction and cost another cloud round trip.
+
+    The channel is one-sided: ``0`` is closed and ``5.4`` is open, so only the
+    upper side ever saturates in practice. Negative values mean the policy
+    predicted past the closed stop and are clamped back to 0 rather than sent
+    to the motor.
+    """
+    global _last_gripper_clip_warn
+    low, high = gripper_limits
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return values
+    below = float(values.min()) < low
+    above = float(values.max()) > high
+    if not (below or above):
+        return values
+    now = time.monotonic()
+    if now - _last_gripper_clip_warn >= _GRIPPER_CLIP_WARN_INTERVAL_S:
+        _last_gripper_clip_warn = now
+        logger.warning(
+            "Policy gripper command spans [%.4f, %.4f], outside [%g, %g]; "
+            "clamped to the limits instead of rejecting the chunk",
+            float(values.min()), float(values.max()), low, high,
+        )
+    return np.clip(values, low, high)
+
+
+def _clamp_grippers(actions, gripper_limits: tuple = GRIPPER_LIMITS):
+    """Clamp the two gripper columns of a raw (T, 16) chunk."""
+    columns = [7, 15]
+    gripper_values = np.asarray(actions[:, columns], dtype=float)
+    clamped = clamp_gripper_commands(gripper_values, gripper_limits)
+    if np.array_equal(clamped, gripper_values):
+        return actions
+    result = np.asarray(actions, dtype=float).copy()
+    result[:, columns] = clamped
+    return result
+
+
 def validate_action_chunk(actions, max_abs_arm_q: float = 3.5,
-                          max_abs_gripper_q: float = 5.5,
+                          gripper_limits: tuple = GRIPPER_LIMITS,
                           max_step: Optional[float] = None,
                           previous_arm_q: Optional[np.ndarray] = None):
-    """Validate a policy action chunk before execution."""
+    """Validate a policy action chunk before execution.
+
+    Arm joints and shape/NaN are hard failures: a bad arm value means the
+    prediction cannot be trusted. Gripper columns are clamped into
+    ``gripper_limits`` because the jaws physically stop at both ends.
+    """
     actions = np.asarray(actions, dtype=float)
     if actions.size == 0:
         raise ValueError("empty action chunk")
@@ -124,13 +183,9 @@ def validate_action_chunk(actions, max_abs_arm_q: float = 3.5,
     if not np.all(np.isfinite(actions)):
         raise ValueError("action chunk contains non-finite values")
     arm_values = np.concatenate([actions[:, 0:7], actions[:, 8:15]], axis=1)
-    gripper_values = actions[:, [7, 15]]
     if np.max(np.abs(arm_values)) > max_abs_arm_q:
         raise ValueError(f"action chunk exceeds arm joint limit {max_abs_arm_q}")
-    if np.max(np.abs(gripper_values)) > max_abs_gripper_q:
-        raise ValueError(
-            f"action chunk exceeds gripper joint limit {max_abs_gripper_q}"
-        )
+    actions = _clamp_grippers(actions, gripper_limits)
     if max_step is not None and previous_arm_q is not None:
         prev = np.asarray(previous_arm_q, dtype=float).reshape(14)
         first_arm = PolicyAdapter.qpos_action_to_g1_action(actions[0])[0]
@@ -658,6 +713,7 @@ class PolicyAdapter:
             np.all(np.isfinite(left)) and np.all(np.isfinite(right)) and np.all(np.isfinite(grips))
         ):
             raise ValueError(f"expected finite poses and grippers (T, 2), got {grips.shape}")
+        grips = clamp_gripper_commands(grips)
         rows = left.shape[0]
         if 0 < self.exec_chunk_steps < rows:
             rows = self.exec_chunk_steps

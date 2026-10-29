@@ -96,6 +96,7 @@ OK
 | `test_a_ignored_until_rollback` | 没回退就按 A 不接管 |
 | `test_tracking_loss_holds_and_reanchor_restarts_blend` | tracking 掉了保持不动，恢复后重新 blend |
 | `test_validate_rejects_bad_chunk` | 越界或含 NaN 的动作 chunk 不下发 |
+| `test_gripper_range_is_clamped_not_rejected` | 夹爪超出 `[0, 5.5]` 时收到端位（低于 0 收到 0，高于 5.5 收到 5.5），整块动作照常执行，不丢弃重试 |
 | `test_success_flag_found_past_the_tail_window` | 真实 `data.json` 很大时，坏轨迹识别仍读得到末尾的 `"success"` |
 | `test_create_episode_does_not_build_a_rerun_logger` | 开始录制不会在控制循环里调 `rr.spawn()`，否则机械臂跳变 |
 | `test_two_episodes_back_to_back` | 连录两条（一成功一失败）都能保存，第二条不会被「recorder is busy」挡掉 |
