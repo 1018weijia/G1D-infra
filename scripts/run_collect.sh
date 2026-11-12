@@ -15,6 +15,7 @@ TASK_NAME="${TASK_NAME:-$G1D_TASK_NAME}"
 TASK_GOAL="${TASK_GOAL:-$G1D_TASK_GOAL}"
 
 if [[ "${SKIP_CAMERA_CHECK:-0}" != "1" ]]; then
+  bash "$SCRIPT_DIR/restart_cameras.sh"
   IMAGE_HOST="$IMAGE_HOST" bash "$SCRIPT_DIR/check_cameras.sh"
 fi
 

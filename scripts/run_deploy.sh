@@ -66,6 +66,7 @@ if (( DRY_RUN == 1 )); then
 fi
 
 if [[ "${SKIP_CAMERA_CHECK:-0}" != "1" ]]; then
+  bash "$SCRIPT_DIR/restart_cameras.sh"
   IMAGE_HOST="$IMAGE_HOST" bash "$SCRIPT_DIR/check_cameras.sh"
 fi
 
