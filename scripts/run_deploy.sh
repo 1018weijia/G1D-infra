@@ -65,6 +65,10 @@ if (( DRY_RUN == 1 )); then
   exit 0
 fi
 
+if [[ "${SKIP_CAMERA_CHECK:-0}" != "1" ]]; then
+  IMAGE_HOST="$IMAGE_HOST" bash "$SCRIPT_DIR/check_cameras.sh"
+fi
+
 if [[ -z "$INSTRUCTION" ]]; then
   echo "[launcher] Set INSTRUCTION to the task language." >&2
   exit 1
